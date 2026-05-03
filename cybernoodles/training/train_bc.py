@@ -99,13 +99,13 @@ BC_LOSS_PRESETS = {
         "direction": 0.00,
     },
     "cut": {
-        "pos": 0.55,
-        "motion": 0.45,
-        "rot": 0.12,
-        "tip": 2.25,
-        "swing": 3.00,
-        "note": 0.35,
-        "direction": 1.75,
+        "pos": 0.85,
+        "motion": 0.55,
+        "rot": 0.16,
+        "tip": 1.35,
+        "swing": 1.65,
+        "note": 0.75,
+        "direction": 0.35,
     },
 }
 ACTIVE_BC_LOSS_WEIGHTS = dict(BC_LOSS_PRESETS["cut"])
@@ -373,6 +373,57 @@ def probe_sort_key(probe_stats, eval_stats=None):
         float(probe_stats.get("mean_cut", 0.0)),
         loss_tiebreak,
     )
+
+
+def bc_probe_key_has_regressed(
+    candidate_probe_key,
+    best_probe_key,
+    *,
+    coverage_fraction=0.5,
+    completion_fraction=0.5,
+    accuracy_fraction=0.5,
+):
+    if candidate_probe_key is None or best_probe_key is None:
+        return False
+    candidate_probe_key = tuple(candidate_probe_key)
+    best_probe_key = tuple(best_probe_key)
+    if len(candidate_probe_key) <= 5 or len(best_probe_key) <= 5:
+        return False
+
+    best_play_ready = int(best_probe_key[0]) > 0
+    candidate_play_ready = int(candidate_probe_key[0]) > 0
+    if best_play_ready and not candidate_play_ready:
+        return True
+
+    best_real_signal = int(best_probe_key[1]) > 0
+    candidate_real_signal = int(candidate_probe_key[1]) > 0
+    if best_real_signal and not candidate_real_signal:
+        return True
+
+    best_coverage = float(best_probe_key[2])
+    candidate_coverage = float(candidate_probe_key[2])
+    if best_coverage > 0.0 and candidate_coverage < best_coverage * float(coverage_fraction):
+        return True
+
+    best_completion = float(best_probe_key[3])
+    candidate_completion = float(candidate_probe_key[3])
+    if best_completion > 0.0 and candidate_completion < best_completion * float(completion_fraction):
+        return True
+
+    best_accuracy = float(best_probe_key[5])
+    candidate_accuracy = float(candidate_probe_key[5])
+    if best_accuracy > 0.0 and candidate_accuracy < best_accuracy * float(accuracy_fraction):
+        return True
+
+    return False
+
+
+def should_save_bc_last_checkpoint(sim_probe, candidate_probe_key, best_probe_key):
+    if not sim_probe:
+        return True
+    if candidate_probe_key is None or best_probe_key is None:
+        return True
+    return not bc_probe_key_has_regressed(candidate_probe_key, best_probe_key)
 
 
 def _relevant_saber_tip(left_tip, right_tip, note_type):
@@ -1138,6 +1189,7 @@ def train_bc(
             )
             print(baseline_suffix)
 
+    last_checkpoint_saved = False
     for epoch in range(epochs):
         model.train()
         epoch_started = time.time()
@@ -1241,19 +1293,28 @@ def train_bc(
 
         raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
         rl_bootstrap_state = build_rl_bootstrap_state_dict(raw_model)
-        save_policy_actor_checkpoint(
-            BC_LAST_MODEL_PATH,
-            rl_bootstrap_state,
-            checkpoint_kind="bc_last",
-        )
 
         probe_key = None
         if probe_stats is not None:
             probe_key = probe_sort_key(probe_stats, eval_stats)
 
+        probe_regressed = bc_probe_key_has_regressed(probe_key, best_probe_key)
+        last_checkpoint_retained = not should_save_bc_last_checkpoint(
+            sim_probe,
+            probe_key,
+            best_probe_key,
+        )
+        if not last_checkpoint_retained:
+            save_policy_actor_checkpoint(
+                BC_LAST_MODEL_PATH,
+                rl_bootstrap_state,
+                checkpoint_kind="bc_last",
+            )
+            last_checkpoint_saved = True
+
         use_probe_for_selection = probe_key is not None and sim_probe
         if use_probe_for_selection:
-            if best_probe_key is None or probe_key > best_probe_key:
+            if not probe_regressed and (best_probe_key is None or probe_key > best_probe_key):
                 best_probe_key = probe_key
                 stale_epochs = 0
                 save_policy_actor_checkpoint(
@@ -1296,25 +1357,26 @@ def train_bc(
                 f"comp {probe_stats['mean_completion']:.2f} "
                 f"clear {probe_stats['mean_clear_rate']:.2f}"
             )
+        last_suffix = f" | {DIM}last retained: probe regression{RST}" if last_checkpoint_retained else ""
         if eval_stats is not None:
             print(
                 f"Epoch {epoch+1:03d}/{epochs} | "
                 f"train {train_loss:.5f} (pos {train_pos:.5f}, motion {train_motion:.5f}, rot {train_rot:.5f}, tip {train_tip:.5f}, swing {train_swing:.5f}, dir {train_dir:.5f}, note {train_note:.5f}) | "
                 f"val {eval_stats['loss']:.5f} (pos {eval_stats['pos']:.5f}, motion {eval_stats['motion']:.5f}, rot {eval_stats['rot']:.5f}, tip {eval_stats['tip']:.5f}, swing {eval_stats['swing']:.5f}, dir {eval_stats['dir']:.5f}, note {eval_stats['note']:.5f}) | "
-                f"{elapsed:.1f}s {best_tag}{probe_suffix}"
+                f"{elapsed:.1f}s {best_tag}{probe_suffix}{last_suffix}"
             )
         elif val_records:
             print(
                 f"Epoch {epoch+1:03d}/{epochs} | "
                 f"train {train_loss:.5f} (pos {train_pos:.5f}, motion {train_motion:.5f}, rot {train_rot:.5f}, tip {train_tip:.5f}, swing {train_swing:.5f}, dir {train_dir:.5f}, note {train_note:.5f}) | "
                 f"{DIM}val skipped (runs every {val_every} epoch(s)){RST} | "
-                f"{elapsed:.1f}s {best_tag}{probe_suffix}"
+                f"{elapsed:.1f}s {best_tag}{probe_suffix}{last_suffix}"
             )
         else:
             print(
                 f"Epoch {epoch+1:03d}/{epochs} | "
                 f"train {train_loss:.5f} (pos {train_pos:.5f}, motion {train_motion:.5f}, rot {train_rot:.5f}, tip {train_tip:.5f}, swing {train_swing:.5f}, dir {train_dir:.5f}, note {train_note:.5f}) | "
-                f"{elapsed:.1f}s {best_tag}{probe_suffix}"
+                f"{elapsed:.1f}s {best_tag}{probe_suffix}{last_suffix}"
             )
 
         if stale_epochs >= patience:
@@ -1322,7 +1384,12 @@ def train_bc(
             break
 
     print(f"\n\033[92mBC training complete.\033[0m Best model saved to {BC_MODEL_PATH}.")
-    print(f"Latest checkpoint saved to {BC_LAST_MODEL_PATH}.")
+    if last_checkpoint_saved:
+        print(f"Latest checkpoint saved to {BC_LAST_MODEL_PATH}.")
+    elif os.path.exists(BC_LAST_MODEL_PATH):
+        print(f"Latest checkpoint retained at {BC_LAST_MODEL_PATH}.")
+    else:
+        print(f"{DIM}Latest checkpoint was not updated because probed epochs regressed.{RST}")
 
 
 if __name__ == "__main__":
