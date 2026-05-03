@@ -27,8 +27,8 @@ A local-run AI that can play Beat Saber!?
 # In active development!
 
 - [ ] Make a standalone RUST exe for just inference
-- [ ] Fix shard schema (I am on Schema v12 - Prototype, prep for Schema v1 - Release)
+- [x] Fix shard schema (I am on Schema v15 - Prototype, prep for Schema v1 - Release)
 - [ ] Fix BC not learning properly (Sim calibration?)
-- [ ] Fix AWAC just regularizing into a BC model?!
-- [ ] Fix hits not resolving properly
-- [ ] Fix default flags (Default to Rust, not to Python)
+- [x] Fix AWAC just regularizing into a BC model?!
+- [x] Fix hits not resolving properly
+- [x] Fix default flags (Default to Rust, not to Python)
