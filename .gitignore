@@ -1,0 +1,33 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Training artifacts and generated outputs
+runs/
+backups/
+scratch/
+torchinductor_cache/
+Past_Models/
+*.bsor
+*.pth
+
+# Large local data and caches
+data/maps/
+data/processed/
+data/player_score_caches/
+Progress Replays/
+
+# Rust build output
+rust/**/target/
