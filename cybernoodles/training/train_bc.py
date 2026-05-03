@@ -16,6 +16,8 @@ from cybernoodles.core.network import (
     ActorCritic,
     CURRENT_POSE_END,
     CURRENT_POSE_START,
+    CURRENT_VELOCITY_END,
+    CURRENT_VELOCITY_START,
     INPUT_DIM,
     NOTE_LANE_INDEX,
     NOTES_DIM,
@@ -29,6 +31,7 @@ from cybernoodles.core.network import (
     NOTE_FEATURES,
     OBSTACLE_FEATURES,
     build_rl_bootstrap_state_dict,
+    normalize_pose_quaternions,
 )
 from cybernoodles.data.dataset_builder import (
     MANIFEST_PATH,
@@ -104,8 +107,8 @@ BC_LOSS_PRESETS = {
         "rot": 0.16,
         "tip": 1.35,
         "swing": 1.65,
-        "note": 0.75,
-        "direction": 0.35,
+        "note": 0.55,
+        "direction": 0.85,
     },
 }
 ACTIVE_BC_LOSS_WEIGHTS = dict(BC_LOSS_PRESETS["cut"])
@@ -303,6 +306,13 @@ def save_policy_actor_checkpoint(path, state_dict, checkpoint_kind):
     )
 
 
+def save_bc_last_checkpoint_if_allowed(path, state_dict, sim_probe, candidate_probe_key, best_probe_key):
+    if not should_save_bc_last_checkpoint(sim_probe, candidate_probe_key, best_probe_key):
+        return False
+    save_policy_actor_checkpoint(path, state_dict, checkpoint_kind="bc_last")
+    return True
+
+
 def run_bc_sim_probe(
     model,
     device,
@@ -488,7 +498,7 @@ def saber_tip_pose_loss(pred, target, state):
     return _weighted_loss(per_sample, near_weight), metric
 
 
-def saber_tip_motion_loss(pred, target, state):
+def saber_tip_motion_loss(pred, target, state, current_pose=None):
     next_note_time = state[:, NOTE_TIME_INDEX].float().clamp(min=0.0, max=4.0)
     note_type = state[:, NOTE_TYPE_INDEX].long()
     active_mask = (next_note_time <= IMMINENT_NOTE_BEAT_WINDOW) & ((note_type == 0) | (note_type == 1))
@@ -496,7 +506,8 @@ def saber_tip_motion_loss(pred, target, state):
         zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
         return zero, 0.0
 
-    current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_END]
+    if current_pose is None:
+        current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_END]
     cur_left_tip, cur_right_tip = predicted_saber_tips(current_pose)
     pred_left_tip, pred_right_tip = predicted_saber_tips(pred)
     tgt_left_tip, tgt_right_tip = predicted_saber_tips(target)
@@ -513,7 +524,7 @@ def saber_tip_motion_loss(pred, target, state):
     return _weighted_loss(per_sample, near_weight), metric
 
 
-def saber_tip_direction_loss(pred, state):
+def saber_tip_direction_loss(pred, state, current_pose=None):
     next_note_time = state[:, NOTE_TIME_INDEX].float().clamp(min=0.0, max=4.0)
     note_type = state[:, NOTE_TYPE_INDEX].long()
     cut_dir = state[:, NOTE_CUT_DX_INDEX:NOTE_CUT_DY_INDEX + 1].float()
@@ -527,7 +538,8 @@ def saber_tip_direction_loss(pred, state):
         zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
         return zero, 0.0
 
-    current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_END]
+    if current_pose is None:
+        current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_END]
     cur_left_tip, cur_right_tip = predicted_saber_tips(current_pose)
     pred_left_tip, pred_right_tip = predicted_saber_tips(pred)
 
@@ -571,9 +583,84 @@ def augment_bc_inputs(batch_x):
     return augmented
 
 
+def _strict_bc_delta_clamp(device, dtype):
+    clamp = torch.empty((POSE_DIM,), device=device, dtype=dtype)
+    clamp[0:3] = 0.08
+    clamp[3:7] = 0.045
+    clamp[7:10] = 0.12
+    clamp[10:14] = 0.07
+    clamp[14:17] = 0.12
+    clamp[17:21] = 0.07
+    return clamp
+
+
+STRICT_BC_HEAD_INERTIA = 0.22
+STRICT_BC_SABER_INERTIA = 0.0
+
+
+def project_bc_pose_action_to_executed_pose(action, state):
+    current_pose = torch.nan_to_num(
+        state[:, CURRENT_POSE_START:CURRENT_POSE_END].to(device=action.device, dtype=action.dtype),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    current_pose = normalize_pose_quaternions(current_pose)
+
+    pose_action = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+    pose_action = normalize_pose_quaternions(pose_action)
+    pose_action = torch.clamp(pose_action, -2.0, 2.0)
+
+    delta_clamp = _strict_bc_delta_clamp(action.device, action.dtype).view(1, POSE_DIM)
+    target_delta = (pose_action - current_pose).clamp(-delta_clamp, delta_clamp)
+
+    current_velocity = torch.nan_to_num(
+        state[:, CURRENT_VELOCITY_START:CURRENT_VELOCITY_END].to(device=action.device, dtype=action.dtype),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    prev_delta = current_velocity * (1.0 / 60.0)
+    prev_head_delta = prev_delta[:, 0:7].clamp(-0.25, 0.25)
+    prev_hand_delta = prev_delta[:, 7:21].clamp(-0.5, 0.5)
+
+    desired_head_delta = (
+        (1.0 - STRICT_BC_HEAD_INERTIA) * target_delta[:, 0:7]
+        + STRICT_BC_HEAD_INERTIA * prev_head_delta
+    )
+    desired_hand_delta = (
+        (1.0 - STRICT_BC_SABER_INERTIA) * target_delta[:, 7:21]
+        + STRICT_BC_SABER_INERTIA * prev_hand_delta
+    )
+    head_accel_limit = delta_clamp[:, 0:7] * (0.20 + 0.55 * (1.0 - STRICT_BC_HEAD_INERTIA))
+    hand_accel_limit = delta_clamp[:, 7:21] * (0.16 + 0.46 * (1.0 - STRICT_BC_SABER_INERTIA))
+
+    head_delta = prev_head_delta + (desired_head_delta - prev_head_delta).clamp(
+        -head_accel_limit,
+        head_accel_limit,
+    )
+    hand_delta = prev_hand_delta + (desired_hand_delta - prev_hand_delta).clamp(
+        -hand_accel_limit,
+        hand_accel_limit,
+    )
+
+    head_delta = torch.nan_to_num(head_delta, nan=0.0, posinf=0.0, neginf=0.0).clamp(-0.25, 0.25)
+    hand_delta = torch.nan_to_num(hand_delta, nan=0.0, posinf=0.0, neginf=0.0).clamp(-0.5, 0.5)
+    return normalize_pose_quaternions(current_pose + torch.cat([head_delta, hand_delta], dim=1))
+
+
 def bc_pose_loss(pred, target, state):
     pos_idx = torch.tensor([0, 1, 2, 7, 8, 9, 14, 15, 16], device=pred.device)
-    current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_END]
+    current_pose = torch.nan_to_num(
+        state[:, CURRENT_POSE_START:CURRENT_POSE_END].to(device=pred.device, dtype=pred.dtype),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    current_pose = normalize_pose_quaternions(current_pose)
+    target = target.to(device=pred.device, dtype=pred.dtype)
+    pred = project_bc_pose_action_to_executed_pose(pred, state)
+    target = project_bc_pose_action_to_executed_pose(target, state)
 
     pred_pos = pred.index_select(1, pos_idx)
     tgt_pos = target.index_select(1, pos_idx)
@@ -591,8 +678,8 @@ def bc_pose_loss(pred, target, state):
     rot_loss = 0.20 * rot_loss_h + 0.40 * rot_loss_l + 0.40 * rot_loss_r
     note_loss, note_metric = note_guidance_loss(pred, state)
     tip_loss, tip_metric = saber_tip_pose_loss(pred, target, state)
-    swing_loss, swing_metric = saber_tip_motion_loss(pred, target, state)
-    direction_loss, direction_metric = saber_tip_direction_loss(pred, state)
+    swing_loss, swing_metric = saber_tip_motion_loss(pred, target, state, current_pose=current_pose)
+    direction_loss, direction_metric = saber_tip_direction_loss(pred, state, current_pose=current_pose)
 
     weights = sample_weights_from_state(state)
     loss_weights = ACTIVE_BC_LOSS_WEIGHTS
@@ -1304,12 +1391,13 @@ def train_bc(
             probe_key,
             best_probe_key,
         )
-        if not last_checkpoint_retained:
-            save_policy_actor_checkpoint(
-                BC_LAST_MODEL_PATH,
-                rl_bootstrap_state,
-                checkpoint_kind="bc_last",
-            )
+        if save_bc_last_checkpoint_if_allowed(
+            BC_LAST_MODEL_PATH,
+            rl_bootstrap_state,
+            sim_probe,
+            probe_key,
+            best_probe_key,
+        ):
             last_checkpoint_saved = True
 
         use_probe_for_selection = probe_key is not None and sim_probe
