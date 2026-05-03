@@ -199,6 +199,19 @@ class TrainingSignalRegressionTests(unittest.TestCase):
             0.001,
             -0.01,
         )
+        cross_metric_collapse_key = (
+            1,
+            1,
+            0.065,
+            0.020,
+            0.0,
+            0.20,
+            5.0,
+            20.0,
+            0.045,
+            0.035,
+            -0.01,
+        )
         mild_drift_key = (
             1,
             1,
@@ -214,14 +227,18 @@ class TrainingSignalRegressionTests(unittest.TestCase):
         )
 
         self.assertTrue(bc_probe_key_has_regressed(collapsed_key, best_key))
+        self.assertGreater(cross_metric_collapse_key, best_key)
+        self.assertTrue(bc_probe_key_has_regressed(cross_metric_collapse_key, best_key))
         self.assertFalse(bc_probe_key_has_regressed(mild_drift_key, best_key))
 
     def test_bc_last_checkpoint_save_skips_probe_collapse_only(self):
         best_key = (1, 1, 0.060, 0.140, 0.0, 3.20, 24.0, 48.0, 0.040, 0.030, -0.50)
         collapsed_key = (0, 0, 0.002, 0.020, 0.0, 0.20, 5.0, 20.0, 0.001, 0.001, -0.01)
+        cross_metric_collapse_key = (1, 1, 0.065, 0.020, 0.0, 0.20, 5.0, 20.0, 0.045, 0.035, -0.01)
         mild_drift_key = (1, 1, 0.055, 0.132, 0.0, 3.00, 23.0, 47.0, 0.038, 0.028, -0.01)
 
         self.assertFalse(should_save_bc_last_checkpoint(True, collapsed_key, best_key))
+        self.assertFalse(should_save_bc_last_checkpoint(True, cross_metric_collapse_key, best_key))
         self.assertTrue(should_save_bc_last_checkpoint(True, mild_drift_key, best_key))
         self.assertTrue(should_save_bc_last_checkpoint(False, collapsed_key, best_key))
         self.assertTrue(should_save_bc_last_checkpoint(True, None, best_key))
