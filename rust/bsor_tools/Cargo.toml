@@ -1,0 +1,18 @@
+[package]
+name = "bsor_tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bytemuck = "1.15"
+byteorder = "1.5"
+clap = { version = "4.5", features = ["derive"] }
+half = { version = "2.4", features = ["bytemuck"] }
+md5 = "0.7"
+rayon = "1.10"
+safetensors = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
