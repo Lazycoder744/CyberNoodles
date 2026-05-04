@@ -12,6 +12,8 @@ from cybernoodles.core.network import (
 from cybernoodles.data.dataset_builder import (
     MANIFEST_VERSION,
     NOTE_FEATURE_LAYOUT,
+    NOTE_TIME_FEATURE_MAX_BEATS,
+    NOTE_TIME_FEATURE_MIN_BEATS,
     SIM_NOTE_TIME_MAX_BEATS,
     SIM_NOTE_TIME_MIN_BEATS,
     SIM_OBSTACLE_TIME_MAX_BEATS,
@@ -43,6 +45,10 @@ def current_policy_schema():
         "sim_note_time_range_beats": (
             float(SIM_NOTE_TIME_MIN_BEATS),
             float(SIM_NOTE_TIME_MAX_BEATS),
+        ),
+        "note_time_feature_range_beats": (
+            float(NOTE_TIME_FEATURE_MIN_BEATS),
+            float(NOTE_TIME_FEATURE_MAX_BEATS),
         ),
         "sim_obstacle_time_range_beats": (
             float(SIM_OBSTACLE_TIME_MIN_BEATS),

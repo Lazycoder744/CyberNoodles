@@ -40,6 +40,8 @@ HEAD_HITBOX_RADIUS = 0.18
 HISTORY_LEN = 30
 DEFAULT_DT = 1.0 / 60.0
 TRACK_Z_BASE = 0.9
+NOTE_TIME_FEATURE_MIN_BEATS = -1.0
+NOTE_TIME_FEATURE_MAX_BEATS = 8.0
 DENSE_APPROACH_SCALE = 2.0
 CONTACT_DISCOVERY_SCALE = 0.15
 SCORE_CAP_NORMAL = 115.0
@@ -54,6 +56,15 @@ ACTIVE_NOTE_WINDOW = 192
 ACTIVE_NOTE_PAST = 32
 ACTIVE_OBSTACLE_WINDOW = 128
 BC_RESET_POSE = DEFAULT_TRACKED_POSE
+DEFAULT_HIT_WINDOW_FRONT = 0.160
+DEFAULT_HIT_WINDOW_BACK = 0.080
+DEFAULT_MISS_WINDOW_BACK = -0.100
+STRICT_HIT_WINDOW_FRONT = 0.080
+STRICT_HIT_WINDOW_BACK = 0.080
+STRICT_MISS_WINDOW_BACK = -0.100
+ASSISTED_HIT_WINDOW_FRONT_BONUS = 0.040
+ASSISTED_HIT_WINDOW_BACK_BONUS = 0.040
+ASSISTED_MISS_WINDOW_BACK_BONUS = 0.050
 
 REWARD_COMPONENT_NAMES = (
     "score_reward",
@@ -659,9 +670,9 @@ class GPUBeatSaberSimulator:
             # Timing windows are tracked in seconds rather than world-space z.
             # A fixed z window makes faster maps artificially harder because the
             # allowed early-hit time shrinks as NJS rises.
-            self._hit_window_front = torch.full((N,), 0.160, device=dev)
-            self._hit_window_back = torch.full((N,), 0.080, device=dev)
-            self._miss_window_back = torch.full((N,), -0.100, device=dev)
+            self._hit_window_front = torch.full((N,), DEFAULT_HIT_WINDOW_FRONT, device=dev)
+            self._hit_window_back = torch.full((N,), DEFAULT_HIT_WINDOW_BACK, device=dev)
+            self._miss_window_back = torch.full((N,), DEFAULT_MISS_WINDOW_BACK, device=dev)
             self._controller_hit_mix = torch.zeros(N, device=dev)
             self._start_energy = torch.full((N,), 0.5, device=dev)
             self._miss_energy = torch.full((N,), 0.10, device=dev)
@@ -855,7 +866,11 @@ class GPUBeatSaberSimulator:
         self._bad_hitbox_scale.fill_(1.0 + 0.18 * level)
 
     def set_rehab_assists(self, level, indices=None):
-        """Relax timing, speed, and direction constraints adaptively."""
+        """Relax speed and direction constraints adaptively.
+
+        Timing windows are controlled by set_hit_timing_profile(). A zero rehab
+        assist level must not make the simulator stricter than its raw defaults.
+        """
         if isinstance(level, bool):
             level = 1.0 if level else 0.0
 
@@ -863,29 +878,50 @@ class GPUBeatSaberSimulator:
         speed_threshold = max(0.55, 1.5 - (0.9 * level))
         direction_threshold = max(-0.05, 0.35 - (0.45 * level))
         contact_reward = CONTACT_DISCOVERY_SCALE + (0.85 * level)
-        # Widen the legal cut timing window in seconds rather than meters so
-        # assistance behaves consistently across maps with different NJS.
-        hit_window_front = 0.080 + (0.040 * level)
-        hit_window_back = 0.080 + (0.040 * level)
-        miss_window_back = -0.100 - (0.050 * level)
         controller_hit_mix = level
 
         if indices is None:
             self._speed_threshold.fill_(speed_threshold)
             self._direction_threshold.fill_(direction_threshold)
             self._w_contact.fill_(contact_reward)
-            self._hit_window_front.fill_(hit_window_front)
-            self._hit_window_back.fill_(hit_window_back)
-            self._miss_window_back.fill_(miss_window_back)
             self._controller_hit_mix.fill_(controller_hit_mix)
         else:
             self._speed_threshold[indices] = speed_threshold
             self._direction_threshold[indices] = direction_threshold
             self._w_contact[indices] = contact_reward
-            self._hit_window_front[indices] = hit_window_front
-            self._hit_window_back[indices] = hit_window_back
-            self._miss_window_back[indices] = miss_window_back
             self._controller_hit_mix[indices] = controller_hit_mix
+
+    def set_hit_timing_profile(self, profile="default", assist_level=0.0, indices=None):
+        """Apply an explicit hit timing profile.
+
+        default/raw preserves the simulator timing defaults, strict opts into
+        the narrower front window, and assisted widens the default profile.
+        """
+        profile_key = str(profile or "default").strip().lower()
+        level = float(max(0.0, min(1.0, assist_level)))
+        if profile_key in {"default", "raw", "none"}:
+            front = DEFAULT_HIT_WINDOW_FRONT
+            back = DEFAULT_HIT_WINDOW_BACK
+            miss_back = DEFAULT_MISS_WINDOW_BACK
+        elif profile_key == "strict":
+            front = STRICT_HIT_WINDOW_FRONT
+            back = STRICT_HIT_WINDOW_BACK
+            miss_back = STRICT_MISS_WINDOW_BACK
+        elif profile_key in {"assisted", "assist", "rehab"}:
+            front = DEFAULT_HIT_WINDOW_FRONT + (ASSISTED_HIT_WINDOW_FRONT_BONUS * level)
+            back = DEFAULT_HIT_WINDOW_BACK + (ASSISTED_HIT_WINDOW_BACK_BONUS * level)
+            miss_back = DEFAULT_MISS_WINDOW_BACK - (ASSISTED_MISS_WINDOW_BACK_BONUS * level)
+        else:
+            raise ValueError(f"Unknown hit timing profile: {profile}")
+
+        if indices is None:
+            self._hit_window_front.fill_(front)
+            self._hit_window_back.fill_(back)
+            self._miss_window_back.fill_(miss_back)
+        else:
+            self._hit_window_front[indices] = front
+            self._hit_window_back[indices] = back
+            self._miss_window_back[indices] = miss_back
 
     def set_survival_assistance(self, level, indices=None):
         """Loosen failure pressure so stuck policies can still see more notes."""
@@ -1359,7 +1395,11 @@ class GPUBeatSaberSimulator:
         raw_t_off_beats = raw_note_time_beats.clamp(-1, 4) * visible
         raw_t_off_seconds = (raw_t_off_beats / safe_bps) * visible
         t_off_seconds = (raw_t_off_seconds + contact_shift_seconds) * visible
-        t_off_beats = (t_off_seconds * safe_bps) * visible
+        t_off_beats = (t_off_seconds * safe_bps).clamp(
+            NOTE_TIME_FEATURE_MIN_BEATS,
+            NOTE_TIME_FEATURE_MAX_BEATS,
+        ) * visible
+        t_off_seconds = (t_off_beats / safe_bps) * visible
         t_off_z = (t_off_seconds * self.note_jump_speed.unsqueeze(1)) * visible
         ngx   = torch.gather(self.note_gx,    1, offs) * visible
         ngy   = torch.gather(self.note_gy,    1, offs) * visible

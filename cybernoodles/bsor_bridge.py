@@ -469,7 +469,12 @@ def payload_to_bsor(payload):
 def load_bsor(replay_path, backend=None):
     backend = _normalize_backend(backend or os.environ.get("CYBERNOODLES_BSOR_BACKEND", "auto"))
     errors = {}
-    ordered_backends = ["python"] if backend == "python" else ["rust", "python"] if backend == "rust" else ["python", "rust"]
+    if backend == "python":
+        ordered_backends = ["python"]
+    elif backend == "rust":
+        ordered_backends = ["rust"]
+    else:
+        ordered_backends = ["rust", "python"]
 
     for candidate in ordered_backends:
         try:
@@ -636,7 +641,7 @@ def validate_bsor(replay_path, backend=None):
             if backend == "rust":
                 raise
 
-    replay = load_bsor(replay_path, backend="python" if backend == "python" else "auto")
+    replay = load_bsor(replay_path, backend="python")
     summary = _python_validation_summary(replay)
     summary["validation_backend"] = "python"
     if rust_error is not None:

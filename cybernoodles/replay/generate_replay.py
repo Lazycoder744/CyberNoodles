@@ -36,7 +36,7 @@ from bsor.Bsor import (
 from cybernoodles.bsor_bridge import load_bsor, validate_bsor, write_bsor
 from cybernoodles.core.jump_timing import compute_spawn_ahead_beats
 from cybernoodles.core.map_storage import slim_map_archive
-from cybernoodles.core.network import ActorCritic, encode_cut_direction, STATIC_HEAD, NOTES_DIM
+from cybernoodles.core.network import ACTION_DIM, ActorCritic, encode_cut_direction, STATIC_HEAD, NOTES_DIM
 from cybernoodles.paths import existing_or_preferred_model_path
 from cybernoodles.training.policy_checkpoint import extract_policy_state_dict
 from cybernoodles.data.dataset_builder import MAPS_DIR, get_map_data, parse_beatmap_dat
@@ -65,6 +65,34 @@ def _blend_actions(new_actions, last_actions, smoothing_alpha):
     if last_actions is None or smoothing_alpha >= 0.999:
         return new_actions
     return (smoothing_alpha * last_actions) + ((1.0 - smoothing_alpha) * new_actions)
+
+
+def _normalize_optional_positive_int(value, *, name):
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive when provided.")
+    return parsed
+
+
+def _resolve_generation_candidate_counts(num_envs, candidates, top_k, device):
+    recording_envs = _normalize_optional_positive_int(num_envs, name="num_envs") or auto_replay_envs(device)
+    candidate_envs = _normalize_optional_positive_int(candidates, name="candidates") or recording_envs
+    rerun_envs = _normalize_optional_positive_int(top_k, name="top_k") or min(recording_envs, candidate_envs)
+    return int(recording_envs), int(candidate_envs), int(max(1, min(rerun_envs, candidate_envs)))
+
+
+def _make_candidate_action_bias(num_envs, device, noise_scale, seed):
+    num_envs = int(num_envs)
+    device = torch.device(device)
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive.")
+    if float(noise_scale) <= 0.0:
+        return torch.zeros((num_envs, ACTION_DIM), device=device, dtype=torch.float32)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    return torch.randn((num_envs, ACTION_DIM), generator=generator, device=device, dtype=torch.float32)
 
 
 def auto_replay_envs(device):
@@ -271,7 +299,8 @@ def _robust_get_notes_cached(map_hash, diff_index, preferred_difficulty):
                                     target_idx = idx
                                     break
                             if target_idx is None:
-                                target_idx = len(maps) - 1
+                                print(f"Requested difficulty {preferred_difficulty} not found in Standard characteristic.")
+                                return None, bpm
                         elif diff_index is None:
                             target_idx = len(maps) - 1
                         else:
@@ -796,7 +825,7 @@ def _build_bsor_from_events(
     return bsor, total_score, max_score, replay_stats
 
 
-def _choose_replay_champion(sim_gpu):
+def _replay_candidate_rank(sim_gpu):
     scores = np.nan_to_num(sim_gpu.total_scores.detach().cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0)
     hits = np.nan_to_num(sim_gpu.total_hits.detach().cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0)
     speed_samples = np.nan_to_num(sim_gpu.speed_samples.clamp(min=1.0).detach().cpu().numpy(), nan=1.0, posinf=1.0, neginf=1.0)
@@ -814,14 +843,7 @@ def _choose_replay_champion(sim_gpu):
     top_score = float(scores.max()) if scores.size else 0.0
     top_hits = float(hits.max()) if hits.size else 0.0
     if top_score <= 0.0:
-        return int(np.argmax(scores)), "score-only fallback"
-
-    candidate_mask = scores >= (top_score * 0.92)
-    if top_hits > 0.0:
-        candidate_mask &= hits >= max(1.0, top_hits * 0.80)
-    candidate_indices = np.where(candidate_mask)[0]
-    if candidate_indices.size == 0:
-        candidate_indices = np.array([int(np.argmax(scores))], dtype=np.int64)
+        return scores, scores, hits
 
     normalized_score = scores / max(top_score, 1e-6)
     normalized_hits = hits / max(top_hits, 1e-6) if top_hits > 0.0 else np.zeros_like(hits)
@@ -837,8 +859,229 @@ def _choose_replay_champion(sim_gpu):
         - 0.16 * oscillation
         - 0.12 * lateral_motion
     )
-    best_local = int(candidate_indices[np.argmax(replay_rank[candidate_indices])])
-    return best_local, f"disciplined-top-{candidate_indices.size}"
+    return replay_rank, scores, hits
+
+
+def _choose_top_replay_candidates(sim_gpu, top_k):
+    replay_rank, scores, hits = _replay_candidate_rank(sim_gpu)
+    if replay_rank.size == 0:
+        return np.asarray([], dtype=np.int64), "empty-candidate-set"
+
+    top_score = float(scores.max()) if scores.size else 0.0
+    top_hits = float(hits.max()) if hits.size else 0.0
+    if top_score <= 0.0:
+        order = np.argsort(scores)[::-1]
+        return order[: max(1, int(top_k))].astype(np.int64), "score-only fallback"
+
+    candidate_mask = scores >= (top_score * 0.92)
+    if top_hits > 0.0:
+        candidate_mask &= hits >= max(1.0, top_hits * 0.80)
+    candidate_indices = np.where(candidate_mask)[0]
+    if candidate_indices.size == 0:
+        candidate_indices = np.array([int(np.argmax(scores))], dtype=np.int64)
+
+    local_order = candidate_indices[np.argsort(replay_rank[candidate_indices])[::-1]]
+    return local_order[: max(1, int(top_k))].astype(np.int64), f"disciplined-top-{candidate_indices.size}"
+
+
+def _choose_replay_champion(sim_gpu):
+    candidate_indices, strategy = _choose_top_replay_candidates(sim_gpu, 1)
+    if candidate_indices.size == 0:
+        return 0, strategy
+    return int(candidate_indices[0]), strategy
+
+
+def _make_generation_env(
+    beatmap,
+    bpm,
+    num_envs,
+    device,
+    *,
+    fail_enabled,
+    survival_level,
+    assist_level,
+    training_wheels,
+):
+    vector_env = make_vector_env(
+        num_envs=int(num_envs),
+        device=device,
+        penalty_weights=(0.5, 0.0, 0.0, 0.0),
+        dense_reward_scale=0.0,
+        training_wheels=training_wheels,
+        rehab_assists=assist_level,
+        survival_assistance=survival_level,
+        stability_assistance=0.0,
+        style_guidance_level=0.0,
+        fail_enabled=fail_enabled,
+        saber_inertia=0.0,
+        rot_clamp=0.07,
+        pos_clamp=0.12,
+    )
+    vector_env.load_maps([beatmap] * int(num_envs), [bpm] * int(num_envs))
+    sim_gpu = vector_env.simulator
+    sim_gpu.reset()
+    return vector_env, sim_gpu
+
+
+def _graph_replay_unsupported_reason(device, model, sim_gpu, *, action_repeat, smoothing_alpha):
+    device = torch.device(device)
+    if device.type != "cuda":
+        return "replay generation CUDA graph requires a CUDA device"
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    if not hasattr(torch.cuda, "CUDAGraph") or not hasattr(torch.cuda, "graph"):
+        return "torch.cuda.CUDAGraph is unavailable"
+    if int(action_repeat) != 1:
+        return "action_repeat must be 1 for CUDA graph replay generation"
+    if abs(float(smoothing_alpha) - 1.0) > 1e-6:
+        return "smoothing_alpha must be 1.0 for CUDA graph replay generation"
+    model_device = None
+    for tensor in model.parameters():
+        model_device = tensor.device
+        break
+    if model_device is None or model_device.type != "cuda":
+        return "model parameters are not on CUDA"
+    sim_device = torch.device(getattr(sim_gpu, "device", device))
+    if sim_device.type != "cuda":
+        return "simulator tensors are not on CUDA"
+    try:
+        state = sim_gpu.get_states()
+    except Exception as exc:
+        return f"sim.get_states() failed during graph eligibility check: {exc}"
+    if not isinstance(state, torch.Tensor) or state.device.type != "cuda":
+        return "simulator state tensor is not on CUDA"
+    return None
+
+
+class _CudaGraphGenerationStep:
+    def __init__(self, model, sim_gpu, action_bias, noise_scale, *, dt=1.0 / FPS, warmup_steps=2):
+        self.model = model
+        self.sim = sim_gpu
+        self.action_bias = action_bias
+        self.noise_scale = float(noise_scale)
+        self.dt = float(dt)
+        self.device = torch.device(getattr(sim_gpu, "device", "cuda"))
+        self.actions = torch.empty((int(sim_gpu.num_envs), ACTION_DIM), device=self.device, dtype=torch.float32)
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture(max(1, int(warmup_steps)))
+
+    def _body(self):
+        state = torch.nan_to_num(self.sim.get_states(), nan=0.0, posinf=0.0, neginf=0.0)
+        mean, std, _value = self.model(state)
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=0.0, neginf=0.0).clamp(-10.0, 10.0)
+        std = torch.nan_to_num(std, nan=1e-6, posinf=5.0, neginf=1e-6).clamp(1e-6, 5.0)
+        if self.noise_scale > 0.0:
+            mean = mean + std * self.action_bias * self.noise_scale
+        self.actions.copy_(sanitize_policy_actions(mean))
+        self.sim.step(self.actions, dt=self.dt)
+
+    def _capture(self, warmup_steps):
+        torch.cuda.synchronize(self.device)
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(warmup_stream), torch.no_grad():
+            for _ in range(warmup_steps):
+                self._body()
+        warmup_stream.synchronize()
+
+        self.sim.reset()
+        torch.cuda.synchronize(self.device)
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            self._body()
+        torch.cuda.synchronize(self.device)
+        self.sim.reset()
+        torch.cuda.synchronize(self.device)
+
+    def replay(self):
+        self.graph.replay()
+
+
+def _sanitize_invalid_scores(sim_gpu):
+    score_snapshot = sim_gpu.total_scores
+    bad_mask = (~torch.isfinite(score_snapshot)) | (score_snapshot < 0.0) | (score_snapshot >= 1e10)
+    bad_count = int(bad_mask.sum().item())
+    if bad_count:
+        print(f"  WARNING: Invalid score detected in {bad_count} env(s); zeroing only those candidates.")
+        sim_gpu.total_scores[bad_mask] = 0.0
+        sim_gpu.total_hits[bad_mask] = 0.0
+    return float(sim_gpu.total_scores.max().item())
+
+
+def _simulate_replay_eager(
+    model,
+    sim_gpu,
+    num_frames,
+    device,
+    *,
+    noise_scale,
+    action_repeat,
+    smoothing_alpha,
+    action_bias=None,
+    record_poses=True,
+):
+    recorded_poses = (
+        torch.zeros((int(num_frames), int(sim_gpu.num_envs), 21), device=device)
+        if record_poses else
+        None
+    )
+    actual_frames = int(num_frames)
+    with torch.no_grad():
+        actions = None
+        last_actions = None
+        for f in range(int(num_frames)):
+            if f % int(action_repeat) == 0 or actions is None:
+                state = sanitize_tensor(sim_gpu.get_states(), "state input")
+                mean, std, _ = model(state)
+                mean = sanitize_tensor(mean, "mean").clamp(-10.0, 10.0)
+                std = sanitize_tensor(std, "std").clamp(1e-6, 5.0)
+
+                if float(noise_scale) <= 0.0:
+                    new_actions = mean
+                elif action_bias is not None:
+                    new_actions = mean + std * action_bias * float(noise_scale)
+                else:
+                    new_actions = mean + torch.randn_like(mean) * std * float(noise_scale)
+
+                actions = sanitize_policy_actions(_blend_actions(new_actions, last_actions, smoothing_alpha))
+                last_actions = actions.clone()
+                actions = sanitize_policy_actions(sanitize_tensor(actions, "actions"))
+
+            sim_gpu.step(actions, dt=1.0 / FPS)
+            if recorded_poses is not None:
+                recorded_poses[f].copy_(sim_gpu.poses)
+
+            if bool(sim_gpu.episode_done.all().item()):
+                actual_frames = f + 1
+                break
+
+            if f % int(FPS * 5) == 0:
+                max_score = _sanitize_invalid_scores(sim_gpu)
+                print(f"  Simulating... {f / max(1, int(num_frames)) * 100:.1f}% | "
+                      f"Highest Score: {max_score:.0f}")
+    return recorded_poses, actual_frames
+
+
+def _simulate_replay_graph_candidates(
+    model,
+    sim_gpu,
+    num_frames,
+    device,
+    *,
+    action_bias,
+    noise_scale,
+):
+    graph_step = _CudaGraphGenerationStep(model, sim_gpu, action_bias, noise_scale)
+    actual_frames = int(num_frames)
+    with torch.no_grad():
+        for f in range(int(num_frames)):
+            graph_step.replay()
+            if f % int(FPS * 5) == 0:
+                max_score = _sanitize_invalid_scores(sim_gpu)
+                print(f"  Graph candidates... {f / max(1, int(num_frames)) * 100:.1f}% | "
+                      f"Highest Score: {max_score:.0f}")
+                if bool(sim_gpu.episode_done.all().item()):
+                    actual_frames = f + 1
+                    break
+    return actual_frames
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -850,7 +1093,8 @@ def generate_bsor(map_hash, output_file="CyberNoodles_Replay.bsor", diff_index=N
                   num_envs=None, noise_scale=0.0, action_repeat=1, smoothing_alpha=1.0,
                   fail_enabled=False, survival_level=0.0, assist_level=0.0,
                   training_wheels=0.0, max_duration_seconds=None, validate_output=True,
-                  preferred_difficulty=None):
+                  preferred_difficulty=None, cuda_graph=False, require_cuda_graph=False,
+                  candidates=None, top_k=None, candidate_seed=1337):
     """Generate a .bsor replay file for a given map.
     
     Args:
@@ -904,94 +1148,127 @@ def generate_bsor(map_hash, output_file="CyberNoodles_Replay.bsor", diff_index=N
         duration_sec = clipped_duration
     num_frames = int(duration_sec * FPS) + 90  # Buffer for follow-through
 
-    # ── GPU Parallel Championship with Event Tracking ─────────────────────────
-    NUM_ENVS = num_envs or auto_replay_envs(device)
-    print(f"Tournament mode: Simulating {NUM_ENVS} parallel replays (GPU-only)...")
-    vector_env = make_vector_env(
-        num_envs=NUM_ENVS,
-        device=device,
-        penalty_weights=(0.5, 0.0, 0.0, 0.0),
-        dense_reward_scale=0.0,
-        training_wheels=training_wheels,
-        rehab_assists=assist_level,
-        survival_assistance=survival_level,
-        stability_assistance=0.0,
-        style_guidance_level=0.0,
-        fail_enabled=fail_enabled,
-        saber_inertia=0.0,
-        rot_clamp=0.07,
-        pos_clamp=0.12,
+    recording_envs, candidate_envs, rerun_envs = _resolve_generation_candidate_counts(
+        num_envs,
+        candidates,
+        top_k,
+        device,
     )
-    vector_env.load_maps([beatmap] * NUM_ENVS, [bpm] * NUM_ENVS)
-    sim_gpu = vector_env.simulator
-    sim_gpu.reset()
 
-    # Enable per-note event tracking for BSOR construction
-    sim_gpu.enable_event_tracking()
-
-    # Record poses on the simulator device, then copy only the winning path to
-    # CPU at the end. This avoids stale host-side frames during long runs.
-    recorded_poses = torch.zeros((num_frames, NUM_ENVS, 21), device=device)
-
+    # ── GPU Parallel Championship with Event Tracking ─────────────────────────
+    graph_used = False
     t_start = time.time()
-    actual_frames = num_frames
-    with torch.no_grad():
-        actions = None
-        last_actions = None
-        for f in range(num_frames):
-            if f % action_repeat == 0 or actions is None:
-                state = sim_gpu.get_states()
-                
-                # ADD: State sanitization
-                state = sanitize_tensor(state, "state input")
-                
-                mean, std, _ = model(state)
-                
-                # ADD: Model output sanitization
-                mean = sanitize_tensor(mean, "mean")
-                std = sanitize_tensor(std, "std")
-                
-                # ADD: Clamp extreme values
-                mean = torch.clamp(mean, -10.0, 10.0)
-                std = torch.clamp(std, 1e-6, 5.0)  # Ensure positive std
-                
-                # Default to deterministic mean actions for showcase replays.
-                if noise_scale <= 0.0:
-                    new_actions = mean
-                else:
-                    new_actions = mean + torch.randn_like(mean) * std * noise_scale
+    candidate_action_bias = None
+    if cuda_graph:
+        print(
+            f"CUDA graph tournament: ranking {candidate_envs} candidates without event tracking; "
+            f"rerunning top {rerun_envs} for BSOR export."
+        )
+        _, candidate_sim = _make_generation_env(
+            beatmap,
+            bpm,
+            candidate_envs,
+            device,
+            fail_enabled=fail_enabled,
+            survival_level=survival_level,
+            assist_level=assist_level,
+            training_wheels=training_wheels,
+        )
+        graph_reason = _graph_replay_unsupported_reason(
+            device,
+            model,
+            candidate_sim,
+            action_repeat=action_repeat,
+            smoothing_alpha=smoothing_alpha,
+        )
+        if graph_reason is not None:
+            if require_cuda_graph:
+                raise RuntimeError(f"CUDA graph replay generation requested but unsupported: {graph_reason}")
+            print(f"  CUDA graph replay fallback: {graph_reason}; using eager tournament.")
+        else:
+            candidate_action_bias = _make_candidate_action_bias(
+                candidate_envs,
+                device,
+                noise_scale,
+                candidate_seed,
+            )
+            _simulate_replay_graph_candidates(
+                model,
+                candidate_sim,
+                num_frames,
+                device,
+                action_bias=candidate_action_bias,
+                noise_scale=noise_scale,
+            )
+            graph_used = True
+            top_indices, top_strategy = _choose_top_replay_candidates(candidate_sim, rerun_envs)
+            if top_indices.size == 0:
+                top_indices = np.arange(min(rerun_envs, candidate_envs), dtype=np.int64)
+                top_strategy = "empty-rank-fallback"
+            selected_bias = candidate_action_bias[
+                torch.as_tensor(top_indices, device=device, dtype=torch.long)
+            ].contiguous()
+            print(
+                f"Graph tournament selected envs {top_indices.tolist()} "
+                f"for export rerun ({top_strategy})."
+            )
+            del candidate_sim
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-                # Apply a low-pass filter while keeping 1.0 as an explicit "off" value.
-                actions = sanitize_policy_actions(_blend_actions(new_actions, last_actions, smoothing_alpha))
-                last_actions = actions.clone()
-                
-                # ADD: Action sanitization
-                actions = sanitize_tensor(actions, "actions")
-                actions = sanitize_policy_actions(actions)
+            _, sim_gpu = _make_generation_env(
+                beatmap,
+                bpm,
+                int(selected_bias.shape[0]),
+                device,
+                fail_enabled=fail_enabled,
+                survival_level=survival_level,
+                assist_level=assist_level,
+                training_wheels=training_wheels,
+            )
+            sim_gpu.enable_event_tracking()
+            recorded_poses, actual_frames = _simulate_replay_eager(
+                model,
+                sim_gpu,
+                num_frames,
+                device,
+                noise_scale=noise_scale,
+                action_repeat=action_repeat,
+                smoothing_alpha=smoothing_alpha,
+                action_bias=selected_bias,
+                record_poses=True,
+            )
 
-            sim_gpu.step(actions, dt=1.0 / FPS)
-            recorded_poses[f].copy_(sim_gpu.poses)
-
-            if bool(sim_gpu.episode_done.all().item()):
-                actual_frames = f + 1
-                break
-
-            # ADD: Score validation during simulation
-            if f % int(FPS * 5) == 0:
-                score_snapshot = sim_gpu.total_scores
-                bad_mask = (~torch.isfinite(score_snapshot)) | (score_snapshot < 0.0) | (score_snapshot >= 1e10)
-                if bool(bad_mask.any().item()):
-                    print(f"  WARNING: Invalid score detected in {int(bad_mask.sum().item())} env(s); zeroing only those candidates.")
-                    sim_gpu.total_scores[bad_mask] = 0.0
-                    sim_gpu.total_hits[bad_mask] = 0.0
-                max_score = float(sim_gpu.total_scores.max().item())
-                 
-                print(f"  Simulating... {f / num_frames * 100:.1f}% | "
-                      f"Highest Score: {max_score:.0f}")
+    if not graph_used:
+        NUM_ENVS = recording_envs
+        print(f"Tournament mode: Simulating {NUM_ENVS} parallel replays (GPU-only)...")
+        _, sim_gpu = _make_generation_env(
+            beatmap,
+            bpm,
+            NUM_ENVS,
+            device,
+            fail_enabled=fail_enabled,
+            survival_level=survival_level,
+            assist_level=assist_level,
+            training_wheels=training_wheels,
+        )
+        sim_gpu.enable_event_tracking()
+        recorded_poses, actual_frames = _simulate_replay_eager(
+            model,
+            sim_gpu,
+            num_frames,
+            device,
+            noise_scale=noise_scale,
+            action_repeat=action_repeat,
+            smoothing_alpha=smoothing_alpha,
+            action_bias=None,
+            record_poses=True,
+        )
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    print(f"Tournament complete in {time.time() - t_start:.2f}s.")
+    graph_suffix = " (CUDA graph candidate pass)" if graph_used else ""
+    print(f"Tournament complete in {time.time() - t_start:.2f}s{graph_suffix}.")
 
     # Identify the Champion
     champion_idx, champion_strategy = _choose_replay_champion(sim_gpu)
@@ -1248,7 +1525,7 @@ def generate_progress_replay(model, device, epoch, map_hash=None, tag=None, num_
         print(f"\033[91m  [Progress Replay] Failed (non-fatal): {e}\033[0m")
 
 
-if __name__ == "__main__":
+def build_replay_generation_arg_parser():
     parser = argparse.ArgumentParser(
         description="Generate a BSOR replay from a model using a BSR code, map hash, or source BSOR."
     )
@@ -1262,7 +1539,17 @@ if __name__ == "__main__":
     parser.add_argument("--noise-scale", type=float, default=0.0, help="Exploration noise scale.")
     parser.add_argument("--smoothing-alpha", type=float, default=1.0, help="Action smoothing retention.")
     parser.set_defaults(fail_enabled=False)
-    args = parser.parse_args()
+    parser.add_argument("--cuda-graph", action="store_true", help="Rank replay candidates with a CUDA graph fast pass, then rerun top candidates for BSOR export.")
+    parser.add_argument("--require-cuda-graph", action="store_true", help="Fail instead of falling back when CUDA graph replay generation is unsupported.")
+    parser.add_argument("--candidates", type=int, default=None, help="Number of CUDA graph candidates to rank. Defaults to --num-envs or the automatic env count.")
+    parser.add_argument("--top-k", type=int, default=1, help="How many ranked candidates to rerun eagerly with event tracking for export.")
+    parser.add_argument("--candidate-seed", type=int, default=1337, help="Seed for fixed per-candidate graph action jitter when --noise-scale > 0.")
+    return parser
+
+
+def main(argv=None):
+    parser = build_replay_generation_arg_parser()
+    args = parser.parse_args(argv)
 
     try:
         hash_id, preferred_difficulty = resolve_generation_input(args.input)
@@ -1284,4 +1571,13 @@ if __name__ == "__main__":
         fail_enabled=bool(args.fail_enabled),
         num_envs=args.num_envs,
         preferred_difficulty=preferred_difficulty,
+        cuda_graph=bool(args.cuda_graph or args.require_cuda_graph),
+        require_cuda_graph=bool(args.require_cuda_graph),
+        candidates=args.candidates,
+        top_k=args.top_k,
+        candidate_seed=args.candidate_seed,
     )
+
+
+if __name__ == "__main__":
+    main()

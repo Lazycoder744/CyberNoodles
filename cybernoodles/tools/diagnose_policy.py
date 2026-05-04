@@ -15,7 +15,15 @@ from cybernoodles.training.policy_eval import (
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a BC/RL policy directly in the simulator.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a BC/RL policy directly in the simulator.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Performance sanity example:\n"
+            "  python -m cybernoodles.tools.diagnose_policy --profile bc --max-maps 1 --num-envs 1\n"
+            "  python -m cybernoodles.tools.diagnose_policy --profile bc --max-maps 1 --num-envs 1 --cuda-graph\n"
+        ),
+    )
     parser.add_argument("--model", default=existing_or_preferred_model_path("bc_model"), help="Path to model or checkpoint file.")
     parser.add_argument("--num-envs", type=int, default=64, help="Parallel envs per evaluated map.")
     parser.add_argument("--noise-scale", type=float, default=0.0, help="Extra stochasticity multiplier on policy std.")
@@ -26,6 +34,14 @@ def main():
     parser.add_argument("--max-maps", type=int, default=4, help="How many curriculum maps to test if --maps is omitted.")
     parser.add_argument("--json-out", default="", help="Optional JSON file for the evaluation summary.")
     parser.add_argument("--verbose", action="store_true", help="Print per-map simulator progress while evaluating.")
+    parser.add_argument("--cuda-graph", action="store_true", help="Opt into CUDA graph capture for supported deterministic eval rollouts.")
+    parser.add_argument("--require-cuda-graph", action="store_true", help="Fail instead of falling back if CUDA graph eval is unsupported.")
+    parser.add_argument(
+        "--cuda-graph-done-check-interval-frames",
+        type=int,
+        default=0,
+        help="Optional graph-mode done check interval. 0 runs each map for its full frame budget.",
+    )
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -48,6 +64,7 @@ def main():
     if not args.maps.strip():
         print(f"Map source: {args.split} / {args.suite} benchmark suite")
     print(f"Noise scale: {args.noise_scale}")
+    print(f"CUDA graph: {'required' if args.require_cuda_graph else ('requested' if args.cuda_graph else 'off')}")
     print()
 
     profiles = ["strict", "bc", "rehab"] if args.profile == "all" else [args.profile]
@@ -70,6 +87,9 @@ def main():
             noise_scale=args.noise_scale,
             verbose=args.verbose,
             label=profile_name,
+            use_cuda_graph=args.cuda_graph or args.require_cuda_graph,
+            require_cuda_graph=args.require_cuda_graph,
+            cuda_graph_done_check_interval_frames=args.cuda_graph_done_check_interval_frames,
             **profile,
         )
         json_summary["profiles"][profile_name] = summary
@@ -84,6 +104,9 @@ def main():
             f"fail={profile['fail_enabled']} "
             f"inertia={profile['saber_inertia']:.2f}"
         )
+        if summary.get("cuda_graph_requested"):
+            graph_status = "used" if summary.get("cuda_graph_used") else "fallback"
+            print(f"  cuda_graph={graph_status}")
         for item in summary["maps"]:
             print(
                 f"  {item['map_hash'][:8]} | "

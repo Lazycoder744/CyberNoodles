@@ -47,6 +47,7 @@ class BeatSaberEnvConfig:
     survival_assistance: float = 0.0
     stability_assistance: float = 0.0
     style_guidance_level: float = 0.0
+    hit_timing_profile: str = "default"
     saber_inertia: float = 0.0
     rot_clamp: float = 0.07
     pos_clamp: float = 0.12
@@ -78,6 +79,7 @@ class BeatSaberVectorEnv:
             survival_assistance=float(self.config.survival_assistance),
             stability_assistance=float(self.config.stability_assistance),
             style_guidance_level=float(self.config.style_guidance_level),
+            hit_timing_profile=str(self.config.hit_timing_profile),
             fail_enabled=bool(self.config.fail_enabled),
             saber_inertia=float(self.config.saber_inertia),
             rot_clamp=float(self.config.rot_clamp),

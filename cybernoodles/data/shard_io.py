@@ -130,8 +130,13 @@ def validate_shard_record(
     shard_root,
     expected_feature_dim,
     expected_target_dim,
-    expected_dtype=torch.float16,
+    expected_feature_dtype=torch.float16,
+    expected_target_dtype=torch.float32,
+    expected_dtype=None,
 ):
+    if expected_dtype is not None:
+        expected_feature_dtype = expected_dtype
+        expected_target_dtype = expected_dtype
     label = shard_record_label(record, shard_root)
     paths = shard_record_paths(record, shard_root)
     missing = [path for path in paths if not os.path.exists(path)]
@@ -165,8 +170,11 @@ def validate_shard_record(
             f"file has {shard_x.shape[0]}"
         )
 
-    for name, tensor in (("x", shard_x), ("y", shard_y)):
-        if tensor.dtype != expected_dtype:
+    for name, tensor, expected_dtype in (
+        ("x", shard_x, expected_feature_dtype),
+        ("y", shard_y, expected_target_dtype),
+    ):
+        if expected_dtype is not None and tensor.dtype != expected_dtype:
             raise RuntimeError(
                 f"Shard dtype mismatch in {label}: {name} expected {expected_dtype}, got {tensor.dtype}"
             )

@@ -18,6 +18,29 @@ DEFAULT_HEAD_POS_CLAMP = 0.08
 DEFAULT_HEAD_ROT_CLAMP = 0.045
 DEFAULT_HAND_POS_CLAMP = 0.12
 DEFAULT_HAND_ROT_CLAMP = 0.07
+CUDA_GRAPH_DEFAULT_DONE_CHECK_INTERVAL_FRAMES = 0
+EMPTY_EVAL_MEAN_KEYS = (
+    "mean_accuracy",
+    "mean_resolved_accuracy",
+    "mean_cut",
+    "mean_completion",
+    "mean_clear_rate",
+    "mean_fail_rate",
+    "mean_timeout_rate",
+    "mean_note_coverage",
+    "mean_resolved_coverage",
+    "mean_engaged_accuracy",
+    "mean_obstacle_ratio",
+    "mean_motion_efficiency",
+    "mean_waste_motion",
+    "mean_idle_motion",
+    "mean_guard_error",
+    "mean_oscillation",
+    "mean_lateral_motion",
+    "mean_style_violation",
+    "mean_angular_violation",
+    "mean_flail_index",
+)
 
 
 def _blend_actions(new_actions, last_actions, smoothing_alpha):
@@ -557,6 +580,7 @@ def get_eval_profile(profile):
         "survival_assistance": float(tuning.survival_assistance),
         "stability_reward_level": float(tuning.stability_assistance),
         "style_guidance_level": float(tuning.style_guidance_level),
+        "hit_timing_profile": str(tuning.hit_timing_profile),
         "fail_enabled": bool(tuning.fail_enabled),
         "saber_inertia": float(tuning.saber_inertia),
         "rot_clamp": float(tuning.rot_clamp),
@@ -569,6 +593,131 @@ def load_curriculum(path="curriculum.json"):
         return []
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _empty_eval_summary(requested_map_hashes, skipped_maps):
+    summary = {
+        "maps": [],
+        "empty_eval": True,
+        "requested_map_count": len(requested_map_hashes),
+        "evaluated_map_count": 0,
+        "skipped_maps": list(skipped_maps),
+    }
+    summary.update({key: None for key in EMPTY_EVAL_MEAN_KEYS})
+    return summary
+
+
+def _handle_empty_eval(requested_map_hashes, skipped_maps, allow_empty):
+    if allow_empty:
+        return _empty_eval_summary(requested_map_hashes, skipped_maps)
+    raise RuntimeError(
+        "No maps were evaluated. "
+        f"requested={len(requested_map_hashes)} skipped={len(skipped_maps)}. "
+        "Pass allow_empty=True only for callers that explicitly handle empty eval summaries."
+    )
+
+
+def _model_device(model):
+    if model is None:
+        return None
+    parameters = model.parameters() if hasattr(model, "parameters") else ()
+    buffers = model.buffers() if hasattr(model, "buffers") else ()
+    for tensor in parameters:
+        return tensor.device
+    for tensor in buffers:
+        return tensor.device
+    return None
+
+
+def _cuda_graph_eval_unsupported_reason(
+    model,
+    device,
+    sim,
+    *,
+    num_envs,
+    noise_scale,
+    action_repeat,
+    smoothing_alpha,
+):
+    eval_device = torch.device(device)
+    if eval_device.type != "cuda":
+        return "eval device is not CUDA"
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    if not hasattr(torch.cuda, "CUDAGraph") or not hasattr(torch.cuda, "graph"):
+        return "torch.cuda.CUDAGraph is unavailable"
+    if float(noise_scale) != 0.0:
+        return "noise_scale must be 0.0 for CUDA graph eval"
+    if int(action_repeat) != 1:
+        return "action_repeat must be 1 for CUDA graph eval"
+    if abs(float(smoothing_alpha) - 1.0) > 1e-6:
+        return "smoothing_alpha must be 1.0 for CUDA graph eval"
+
+    model_device = _model_device(model)
+    if model_device is None or model_device.type != "cuda":
+        return "model parameters are not on CUDA"
+
+    sim_device = torch.device(getattr(sim, "device", eval_device))
+    if sim_device.type != "cuda":
+        return "simulator tensors are not on CUDA"
+
+    try:
+        state = sim.get_states()
+    except Exception as exc:
+        return f"sim.get_states() failed during graph eligibility check: {exc}"
+
+    if not isinstance(state, torch.Tensor):
+        return "sim.get_states() did not return a tensor"
+    if state.device.type != "cuda":
+        return "simulator state tensor is not on CUDA"
+    if state.dim() != 2 or int(state.shape[0]) != int(num_envs):
+        return f"simulator state shape {tuple(state.shape)} is not fixed for {int(num_envs)} envs"
+    return None
+
+
+class _CudaGraphEvalStep:
+    def __init__(self, model, sim, *, start_times=None, dt=1.0 / FPS, warmup_steps=2):
+        self.model = model
+        self.sim = sim
+        self.start_times = start_times
+        self.dt = float(dt)
+        self.device = torch.device(getattr(sim, "device", "cuda"))
+        self.actions = torch.empty((int(sim.num_envs), ACTION_DIM), device=self.device, dtype=torch.float32)
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture(max(1, int(warmup_steps)))
+
+    def _body(self):
+        state = self.sim.get_states()
+        mean, _std, _value = self.model(state)
+        self.actions.copy_(sanitize_policy_actions(mean))
+        self.sim.step(self.actions, dt=self.dt)
+
+    def _reset(self):
+        self.sim.reset(start_times=self.start_times)
+
+    def _capture(self, warmup_steps):
+        torch.cuda.synchronize(self.device)
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(warmup_stream), torch.no_grad():
+            for _ in range(warmup_steps):
+                self._body()
+        warmup_stream.synchronize()
+
+        self._reset()
+        torch.cuda.synchronize(self.device)
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            self._body()
+        torch.cuda.synchronize(self.device)
+        self._reset()
+        torch.cuda.synchronize(self.device)
+
+    def replay(self):
+        self.graph.replay()
+
+
+def _format_cuda_graph_fallback(label, reason):
+    tag = f"[{label}] " if label else ""
+    return f"  {tag}CUDA graph eval fallback: {reason}; using eager simulator loop."
 
 
 def evaluate_policy_model(
@@ -585,6 +734,7 @@ def evaluate_policy_model(
     survival_assistance=0.0,
     stability_reward_level=0.0,
     style_guidance_level=0.0,
+    hit_timing_profile="default",
     fail_enabled=True,
     saber_inertia=0.0,
     rot_clamp=DEFAULT_HAND_ROT_CLAMP,
@@ -592,8 +742,33 @@ def evaluate_policy_model(
     label=None,
     verbose=False,
     start_time_sampler=None,
+    allow_empty=False,
+    use_cuda_graph=False,
+    require_cuda_graph=False,
+    cuda_graph_done_check_interval_frames=CUDA_GRAPH_DEFAULT_DONE_CHECK_INTERVAL_FRAMES,
 ):
     results = []
+    requested_map_hashes = list(map_hashes or [])
+    skipped_maps = []
+    cuda_graph_requested = bool(use_cuda_graph)
+    cuda_graph_used = False
+    cuda_graph_fallback_reasons = []
+    eval_maps = []
+    for map_hash in requested_map_hashes:
+        summary = summarize_eval_map(map_hash, map_cache=map_cache)
+        bpm = summary["bpm"]
+        notes = summary["notes"]
+        if bpm is None:
+            skipped_maps.append({"map_hash": map_hash, "reason": "missing_map"})
+            continue
+        if not notes:
+            skipped_maps.append({"map_hash": map_hash, "reason": "no_notes"})
+            continue
+        eval_maps.append((map_hash, summary))
+
+    if not eval_maps:
+        return _handle_empty_eval(requested_map_hashes, skipped_maps, allow_empty)
+
     action_repeat = max(1, int(action_repeat))
     progress_interval_frames = max(1, int(15.0 * FPS))
     vector_env = make_vector_env(
@@ -606,6 +781,7 @@ def evaluate_policy_model(
         survival_assistance=survival_assistance,
         stability_assistance=stability_reward_level,
         style_guidance_level=style_guidance_level,
+        hit_timing_profile=hit_timing_profile,
         fail_enabled=fail_enabled,
         saber_inertia=float(saber_inertia),
         rot_clamp=rot_clamp,
@@ -613,16 +789,12 @@ def evaluate_policy_model(
     )
     sim = vector_env.simulator
 
-    for map_hash in map_hashes:
-        summary = summarize_eval_map(map_hash, map_cache=map_cache)
+    for map_hash, summary in eval_maps:
         beatmap = summary["beatmap"]
         bpm = summary["bpm"]
         notes = summary["notes"]
         obstacles = summary["obstacles"]
         scorable_notes = summary["scorable_notes"]
-
-        if not notes or bpm is None:
-            continue
 
         duration_sec = summary["duration_sec"]
         num_frames = int(duration_sec * FPS) + 90
@@ -646,36 +818,101 @@ def evaluate_policy_model(
                     )
         sim.reset(start_times=start_times)
 
-        actions = None
-        last_actions = None
         frames_simulated = 0
-        with torch.no_grad():
-            for frame_idx in range(num_frames):
-                if frame_idx % action_repeat == 0 or actions is None:
-                    state = sim.get_states()
-                    mean, std, _ = model(state)
 
-                    if noise_scale > 0.0:
-                        new_actions = mean + torch.randn_like(mean) * std * noise_scale
-                    else:
-                        new_actions = mean
+        graph_step = None
+        if cuda_graph_requested:
+            graph_reason = _cuda_graph_eval_unsupported_reason(
+                model,
+                device,
+                sim,
+                num_envs=num_envs,
+                noise_scale=noise_scale,
+                action_repeat=action_repeat,
+                smoothing_alpha=smoothing_alpha,
+            )
+            if graph_reason is None:
+                try:
+                    graph_step = _CudaGraphEvalStep(model, sim, start_times=start_times, dt=1.0 / FPS)
+                except Exception as exc:
+                    graph_reason = f"capture failed: {str(exc).splitlines()[0]}"
+                    sim.reset(start_times=start_times)
+            if graph_reason is not None:
+                cuda_graph_fallback_reasons.append(
+                    {"map_hash": map_hash, "reason": graph_reason}
+                )
+                if require_cuda_graph:
+                    raise RuntimeError(f"CUDA graph eval requested but unsupported for {map_hash}: {graph_reason}")
+                if verbose:
+                    print(_format_cuda_graph_fallback(label, graph_reason))
 
-                    actions = sanitize_policy_actions(_blend_actions(new_actions, last_actions, smoothing_alpha))
-                    last_actions = actions
+        if graph_step is not None:
+            done_check_interval = max(0, int(cuda_graph_done_check_interval_frames))
+            try:
+                with torch.no_grad():
+                    for frame_idx in range(num_frames):
+                        graph_step.replay()
+                        frames_simulated = frame_idx + 1
+                        if verbose and frames_simulated % progress_interval_frames == 0:
+                            tag = f"[{label}] " if label else ""
+                            mean_completion = float(compute_completion_ratios(sim, start_times=start_times).mean().item())
+                            done_ratio = sim.episode_done.float().mean().item()
+                            print(
+                                f"  {tag}progress {map_hash[:8]}... "
+                                f"{frames_simulated / FPS:.1f}s/{duration_sec:.1f}s | "
+                                f"done {done_ratio:.2f} | comp {mean_completion:.2f}"
+                            )
+                        should_check_done = (
+                            done_check_interval > 0
+                            and frames_simulated % done_check_interval == 0
+                        )
+                        if frames_simulated == num_frames or should_check_done:
+                            if bool(sim.episode_done.all()):
+                                break
+            except Exception as exc:
+                graph_reason = f"replay failed: {str(exc).splitlines()[0]}"
+                cuda_graph_fallback_reasons.append(
+                    {"map_hash": map_hash, "reason": graph_reason}
+                )
+                if require_cuda_graph:
+                    raise RuntimeError(f"CUDA graph eval replay failed for {map_hash}: {graph_reason}") from exc
+                if verbose:
+                    print(_format_cuda_graph_fallback(label, graph_reason))
+                sim.reset(start_times=start_times)
+                graph_step = None
+            else:
+                cuda_graph_used = True
 
-                sim.step(actions, dt=1.0 / FPS)
-                frames_simulated = frame_idx + 1
-                if verbose and frames_simulated % progress_interval_frames == 0:
-                    tag = f"[{label}] " if label else ""
-                    mean_completion = float(compute_completion_ratios(sim, start_times=start_times).mean().item())
-                    done_ratio = sim.episode_done.float().mean().item()
-                    print(
-                        f"  {tag}progress {map_hash[:8]}... "
-                        f"{frames_simulated / FPS:.1f}s/{duration_sec:.1f}s | "
-                        f"done {done_ratio:.2f} | comp {mean_completion:.2f}"
-                    )
-                if bool(sim.episode_done.all()):
-                    break
+        if graph_step is None:
+            actions = None
+            last_actions = None
+            with torch.no_grad():
+                for frame_idx in range(num_frames):
+                    if frame_idx % action_repeat == 0 or actions is None:
+                        state = sim.get_states()
+                        mean, std, _ = model(state)
+
+                        if noise_scale > 0.0:
+                            new_actions = mean + torch.randn_like(mean) * std * noise_scale
+                        else:
+                            new_actions = mean
+
+                        actions = sanitize_policy_actions(_blend_actions(new_actions, last_actions, smoothing_alpha))
+                        last_actions = actions
+
+                    sim.step(actions, dt=1.0 / FPS)
+                    frames_simulated = frame_idx + 1
+                    if verbose and frames_simulated % progress_interval_frames == 0:
+                        tag = f"[{label}] " if label else ""
+                        mean_completion = float(compute_completion_ratios(sim, start_times=start_times).mean().item())
+                        done_ratio = sim.episode_done.float().mean().item()
+                        print(
+                            f"  {tag}progress {map_hash[:8]}... "
+                            f"{frames_simulated / FPS:.1f}s/{duration_sec:.1f}s | "
+                            f"done {done_ratio:.2f} | comp {mean_completion:.2f}"
+                        )
+                    if bool(sim.episode_done.all()):
+                        break
 
         metrics = summarize_play_metrics(sim, start_times=start_times)
 
@@ -723,32 +960,17 @@ def evaluate_policy_model(
             )
 
     if not results:
-        return {
-            "maps": [],
-            "mean_accuracy": 0.0,
-            "mean_resolved_accuracy": 0.0,
-            "mean_cut": 0.0,
-            "mean_completion": 0.0,
-            "mean_clear_rate": 0.0,
-            "mean_fail_rate": 0.0,
-            "mean_timeout_rate": 0.0,
-            "mean_note_coverage": 0.0,
-            "mean_resolved_coverage": 0.0,
-            "mean_engaged_accuracy": 0.0,
-            "mean_obstacle_ratio": 0.0,
-            "mean_motion_efficiency": 0.0,
-            "mean_waste_motion": 0.0,
-            "mean_idle_motion": 0.0,
-            "mean_guard_error": 0.0,
-            "mean_oscillation": 0.0,
-            "mean_lateral_motion": 0.0,
-            "mean_style_violation": 0.0,
-            "mean_angular_violation": 0.0,
-            "mean_flail_index": 0.0,
-        }
+        return _handle_empty_eval(requested_map_hashes, skipped_maps, allow_empty)
 
     return {
         "maps": results,
+        "empty_eval": False,
+        "requested_map_count": len(requested_map_hashes),
+        "evaluated_map_count": len(results),
+        "skipped_maps": skipped_maps,
+        "cuda_graph_requested": cuda_graph_requested,
+        "cuda_graph_used": cuda_graph_used,
+        "cuda_graph_fallback_reasons": cuda_graph_fallback_reasons,
         "mean_accuracy": sum(r["accuracy"] for r in results) / len(results),
         "mean_resolved_accuracy": sum(r["resolved_accuracy"] for r in results) / len(results),
         "mean_engaged_accuracy": sum(r["engaged_accuracy"] for r in results) / len(results),

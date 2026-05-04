@@ -39,7 +39,7 @@ VAL_DIR = os.path.join(SHARD_ROOT, "val")
 MANIFEST_PATH = os.path.join(SHARD_ROOT, "manifest.json")
 SELECTED_SCORES_PATH = os.path.join(DATA_DIR, "selected_scores.json")
 
-MANIFEST_VERSION = 15
+MANIFEST_VERSION = 16
 MANIFEST_SEMANTIC_SCHEMA_ID = "bc-shard-semantics-v1"
 NOTE_LOOKAHEAD_BEATS = 1.25
 FOLLOWTHROUGH_BEATS = 0.35
@@ -56,6 +56,8 @@ SIM_SAMPLE_DT = 1.0 / SIM_SAMPLE_HZ
 # timing distribution it sees during closed-loop rollout.
 SIM_NOTE_TIME_MIN_BEATS = -1.0
 SIM_NOTE_TIME_MAX_BEATS = 4.0
+NOTE_TIME_FEATURE_MIN_BEATS = -1.0
+NOTE_TIME_FEATURE_MAX_BEATS = 8.0
 SIM_OBSTACLE_TIME_MIN_BEATS = -1.0
 SIM_OBSTACLE_TIME_MAX_BEATS = 6.0
 NOTE_FEATURE_LAYOUT = "spawn_visible_contact_shifted_beat_time+physical_time+physical_z"
@@ -69,8 +71,11 @@ SCORE_CLASS_ARC_HEAD = 1.0
 SCORE_CLASS_ARC_TAIL = 2.0
 SCORE_CLASS_CHAIN_HEAD = 3.0
 SCORE_CLASS_CHAIN_LINK = 4.0
-SHARD_STORAGE_DTYPE = "float16"
 ACTION_ABS_COMPONENT_LIMIT = 2.0
+STATE_POSE_POSITION_ABS_LIMIT = ACTION_ABS_COMPONENT_LIMIT
+FEATURE_STORAGE_DTYPE = "float16"
+TARGET_STORAGE_DTYPE = "float32"
+SHARD_STORAGE_DTYPE = f"features={FEATURE_STORAGE_DTYPE},targets={TARGET_STORAGE_DTYPE}"
 TARGET_ACTION_DELTA_CLAMP = (
     0.08, 0.08, 0.08, 0.045, 0.045, 0.045, 0.045,
     0.12, 0.12, 0.12, 0.07, 0.07, 0.07, 0.07,
@@ -132,6 +137,7 @@ def manifest_semantic_metadata():
         "background_frame_stride": BACKGROUND_FRAME_STRIDE,
         "target_pose_horizon_frames": TARGET_POSE_HORIZON_FRAMES,
         "sim_note_time_range_beats": [SIM_NOTE_TIME_MIN_BEATS, SIM_NOTE_TIME_MAX_BEATS],
+        "note_time_feature_range_beats": [NOTE_TIME_FEATURE_MIN_BEATS, NOTE_TIME_FEATURE_MAX_BEATS],
         "sim_obstacle_time_range_beats": [SIM_OBSTACLE_TIME_MIN_BEATS, SIM_OBSTACLE_TIME_MAX_BEATS],
         "num_upcoming_notes": NUM_UPCOMING_NOTES,
         "note_features": NOTE_FEATURES,
@@ -141,6 +147,7 @@ def manifest_semantic_metadata():
         "velocity_dim": VELOCITY_DIM,
         "track_z_base": TRACK_Z_BASE,
         "shard_storage_dtype": SHARD_STORAGE_DTYPE,
+        "feature_storage_dtype": FEATURE_STORAGE_DTYPE,
         "action_contract": {
             "action_dim": POSE_DIM,
             "action_representation": "absolute_tracked_pose_target",
@@ -158,7 +165,7 @@ def manifest_semantic_metadata():
             ),
             "future_pose_horizon_frames": TARGET_POSE_HORIZON_FRAMES,
             "normalizes_quaternions": True,
-            "stored_dtype": SHARD_STORAGE_DTYPE,
+            "stored_dtype": TARGET_STORAGE_DTYPE,
         },
         "sentinel_contract": {
             "missing_note": {
@@ -395,6 +402,27 @@ def _normalize_pose_quaternions(pose):
     for start, end in POSE_QUATERNION_SLICES:
         pose[start:end] = _normalize_quaternion(pose[start:end])
     return pose
+
+
+def _apply_state_pose_contract(poses):
+    poses = np.asarray(poses, dtype=np.float32).copy()
+    for start, end in POSE_POSITION_SLICES:
+        poses[..., start:end] = np.clip(
+            poses[..., start:end],
+            -STATE_POSE_POSITION_ABS_LIMIT,
+            STATE_POSE_POSITION_ABS_LIMIT,
+        )
+    for start, end in POSE_QUATERNION_SLICES:
+        segment = poses[..., start:end]
+        norm = np.linalg.norm(segment, axis=-1, keepdims=True)
+        identity = np.zeros_like(segment)
+        identity[..., 3] = 1.0
+        poses[..., start:end] = np.where(
+            norm > 1e-6,
+            segment / np.clip(norm, 1e-6, None),
+            identity,
+        )
+    return poses
 
 
 def _sim_executable_pose_target(current_pose, future_pose):
@@ -775,6 +803,7 @@ def _select_dat_file(info_data, preferred_mode=None, preferred_difficulty=None, 
 
     pref_mode = normalize_mode_name(preferred_mode or "Standard")
     pref_diff = normalize_difficulty_name(preferred_difficulty or "")
+    has_preferred_difficulty = pref_diff != ""
 
     exact_match = [
         entry for entry in entries
@@ -783,6 +812,9 @@ def _select_dat_file(info_data, preferred_mode=None, preferred_difficulty=None, 
     ]
     if exact_match:
         return exact_match[0]['filename']
+
+    if has_preferred_difficulty:
+        return None
 
     mode_match = [entry for entry in entries if normalize_mode_name(entry['mode']) == pref_mode]
     if mode_match:
@@ -989,7 +1021,12 @@ def _build_note_feature_vector(notes, note_idx, t_beat, bps, note_jump_speed, he
             # settings. BC must see the same note visibility and state timing
             # that it will get during closed-loop rollout.
             time_seconds = (time_offset / safe_bps) + ((TRACK_Z_BASE + safe_head_z) / max(safe_njs, 1e-6))
-            contact_time_beats = time_seconds * safe_bps
+            contact_time_beats = float(np.clip(
+                time_seconds * safe_bps,
+                NOTE_TIME_FEATURE_MIN_BEATS,
+                NOTE_TIME_FEATURE_MAX_BEATS,
+            ))
+            time_seconds = contact_time_beats / safe_bps
             z_distance = time_seconds * safe_njs
             dx, dy = encode_cut_direction(note['cutDirection'])
             feature_vec.extend([
@@ -1053,7 +1090,9 @@ def extract_features(frames, beatmap_or_notes, bpm):
     if len(frames) < (MIN_REPLAY_FRAMES + TARGET_POSE_HORIZON_FRAMES) or len(notes) < 2:
         return [], [], {}
 
-    poses = np.asarray([frame['pose'][0:21] for frame in frames], dtype=np.float32)
+    poses = _apply_state_pose_contract(
+        np.asarray([frame['pose'][0:21] for frame in frames], dtype=np.float32)
+    )
     times = np.asarray([frame['time'] for frame in frames], dtype=np.float32)
     bps = max(float(bpm) / 60.0, 1e-6)
     note_jump_speed = float(beatmap.get('njs', 18.0) or 18.0)
@@ -1157,6 +1196,9 @@ def process_single(bsor_file):
         preferred_mode=replay_meta.get('mode'),
     )
     if not beatmap:
+        if normalize_difficulty_name(replay_meta.get('difficulty')) != "":
+            print(f"  Missing map/difficulty for {replay_meta['song_hash']}")
+            return None
         fallback_beatmap, fallback_bpm = get_map_data(replay_meta['song_hash'])
         if not fallback_beatmap:
             print(f"  Missing map/difficulty for {replay_meta['song_hash']}")
@@ -1172,6 +1214,8 @@ def process_single(bsor_file):
         return None
 
     replay_meta.update(stats)
+    replay_meta["mode"] = beatmap.get("mode", replay_meta.get("mode"))
+    replay_meta["difficulty"] = beatmap.get("difficulty", replay_meta.get("difficulty"))
     replay_meta["bpm"] = float(bpm)
     replay_meta["njs"] = float(beatmap.get('njs', 18.0) or 18.0)
     replay_meta["jump_offset"] = float(beatmap.get('offset', 0.0) or 0.0)
@@ -1258,9 +1302,8 @@ def _write_replay_shard_files(split, replay_name, X, y):
         raise ValueError(f"{replay_name} contains non-finite shard tensors")
 
     tx = tx.to(dtype=torch.float16)
-    ty = ty.to(dtype=torch.float16)
     if not torch.isfinite(tx).all() or not torch.isfinite(ty).all():
-        raise ValueError(f"{replay_name} overflows float16 shard storage")
+        raise ValueError(f"{replay_name} overflows shard storage")
 
     _safe_torch_save(tx, x_path)
     _safe_torch_save(ty, y_path)
@@ -1350,6 +1393,13 @@ def _format_replay_preview(replay_names, limit=5):
     if len(replay_names) > limit:
         preview.append("...")
     return ", ".join(preview)
+
+
+def _pending_replay_paths(bsor_files, done_set):
+    return [
+        replay for replay in bsor_files
+        if os.path.basename(replay) not in done_set
+    ]
 
 
 def _process_and_save_single_for_builder(bsor_file):
@@ -1575,15 +1625,12 @@ def _process_data_python(
         save_manifest(manifest)
 
     done_set = set(manifest.get("done", []))
-    failed_set = set(manifest.get("failed", []))
-    remaining = [
-        replay for replay in bsor_files
-        if os.path.basename(replay) not in done_set and os.path.basename(replay) not in failed_set
-    ]
+    remaining = _pending_replay_paths(bsor_files, done_set)
 
+    failed_count = len(set(manifest.get("failed", [])))
     print(
         f"Found {len(bsor_files)} replays total. "
-        f"{len(done_set)} already processed, {len(failed_set)} failed, "
+        f"{len(done_set)} already processed, {failed_count} failed history, "
         f"{len(remaining)} remaining."
     )
     if selected_subset is not None:

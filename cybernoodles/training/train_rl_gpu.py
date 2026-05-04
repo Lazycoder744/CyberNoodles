@@ -163,14 +163,16 @@ def pick_total_envs(device, num_tribes):
 
 
 def build_recovery_sim_tuning(recovery):
+    assist_level = float(recovery['assist_level'])
     return SimulatorTuning(
         penalty_weights=(0.0, 0.0, 0.0, 0.0),
         dense_reward_scale=0.0,
         training_wheels=float(recovery['training_wheels']),
-        rehab_assists=float(recovery['assist_level']),
+        rehab_assists=assist_level,
         survival_assistance=float(recovery['survival_level']),
         stability_assistance=float(recovery['stability_reward_level']),
         style_guidance_level=float(recovery['style_guidance_level']),
+        hit_timing_profile="assisted" if assist_level > 0.0 else "default",
         fail_enabled=bool(recovery['fail_enabled']),
         saber_inertia=0.0,
         rot_clamp=0.07,
@@ -1367,14 +1369,16 @@ def get_recovery_profile(adaptive_state, global_best_acc, current_task_acc=None)
 
 
 def build_training_matched_eval_profile(tribe, recovery):
+    assist_level = float(recovery.get('assist_level', 0.0))
     return {
         'action_repeat': int(max(1, getattr(tribe, 'current_action_repeat', tribe.hparams.get('action_repeat', 2)))),
         'smoothing_alpha': 1.0,
         'training_wheels_level': float(recovery.get('training_wheels', 0.0)),
-        'assist_level': float(recovery.get('assist_level', 0.0)),
+        'assist_level': assist_level,
         'survival_assistance': float(recovery.get('survival_level', 0.0)),
         'stability_reward_level': float(recovery.get('stability_reward_level', 0.0)),
         'style_guidance_level': float(recovery.get('style_guidance_level', 0.0)),
+        'hit_timing_profile': "assisted" if assist_level > 0.0 else "default",
         'fail_enabled': bool(recovery.get('fail_enabled', True)),
         'saber_inertia': float(getattr(tribe, 'current_saber_inertia', tribe.hparams.get('saber_inertia', 0.35))),
         'rot_clamp': float(getattr(tribe, 'current_rot_clamp', tribe.hparams.get('rot_clamp', 0.10))),

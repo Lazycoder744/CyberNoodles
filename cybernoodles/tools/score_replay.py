@@ -8,7 +8,13 @@ import torch
 
 from cybernoodles.bsor_bridge import load_bsor
 from cybernoodles.core.gpu_simulator import HISTORY_LEN
-from cybernoodles.data.dataset_builder import MAPS_DIR, REPLAYS_DIR, get_map_data, parse_bsor
+from cybernoodles.data.dataset_builder import (
+    MAPS_DIR,
+    REPLAYS_DIR,
+    get_map_data,
+    normalize_difficulty_name,
+    parse_bsor,
+)
 from cybernoodles.data.fetch_data import download_file, get_beatsaver_map_url, slim_map_postprocess
 from cybernoodles.envs import make_vector_env
 from cybernoodles.oracle import score_loaded_replay_with_oracle
@@ -203,7 +209,7 @@ def score_replay(replay_path, device, fail_enabled=True, track_events=False, fra
             preferred_difficulty=replay_meta.get("difficulty"),
             preferred_mode=replay_meta.get("mode"),
         )
-    if not beatmap:
+    if not beatmap and normalize_difficulty_name(replay_meta.get("difficulty")) == "":
         beatmap, bpm = get_map_data(replay_meta["song_hash"])
     if not beatmap or bpm is None:
         raise RuntimeError(f"Missing beatmap for replay song hash {replay_meta['song_hash']}")

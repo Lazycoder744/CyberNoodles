@@ -667,6 +667,34 @@ def collect_rollout(actor, sim, args, map_batch):
     return batch, metrics
 
 
+def awac_eval_cuda_graph_kwargs(args):
+    require_cuda_graph = bool(getattr(args, "require_eval_cuda_graph", False))
+    use_cuda_graph = bool(getattr(args, "eval_cuda_graph", False)) or require_cuda_graph
+    return {
+        "use_cuda_graph": use_cuda_graph,
+        "require_cuda_graph": require_cuda_graph,
+        "cuda_graph_done_check_interval_frames": int(
+            getattr(args, "eval_cuda_graph_done_check_interval_frames", 0)
+        ),
+    }
+
+
+def should_run_awac_preflight(preflight_hashes, skip_bootstrap_preflight):
+    return bool(preflight_hashes) and not bool(skip_bootstrap_preflight)
+
+
+def should_run_awac_baseline_eval(best_eval_key, skip_baseline_eval):
+    return best_eval_key is None and not bool(skip_baseline_eval)
+
+
+def should_run_awac_epoch_eval(epoch, eval_every, skip_initial_eval):
+    eval_every = int(eval_every)
+    if eval_every <= 0:
+        return False
+    epoch = int(epoch)
+    return ((epoch + 1) % eval_every == 0) or (epoch == 0 and not bool(skip_initial_eval))
+
+
 def run_eval(actor, device, eval_hashes, map_cache, args, label, profile, start_time_sampler=None):
     summary = evaluate_policy_model(
         actor,
@@ -678,6 +706,7 @@ def run_eval(actor, device, eval_hashes, map_cache, args, label, profile, start_
         verbose=True,
         label=label,
         start_time_sampler=start_time_sampler,
+        **awac_eval_cuda_graph_kwargs(args),
         **profile,
     )
     print(
@@ -688,6 +717,9 @@ def run_eval(actor, device, eval_hashes, map_cache, args, label, profile, start_
         f"comp {summary['mean_completion']:.2f} | "
         f"clear {summary['mean_clear_rate']:.2f}"
     )
+    if summary.get("cuda_graph_requested"):
+        graph_status = "used" if summary.get("cuda_graph_used") else "fallback"
+        print(f"  [{label}] cuda_graph={graph_status}")
     return summary
 
 
@@ -762,6 +794,8 @@ def eval_profiles_match(left, right, *, atol=1e-6):
     if int(left.get("action_repeat", 1)) != int(right.get("action_repeat", 1)):
         return False
     if bool(left.get("fail_enabled", True)) != bool(right.get("fail_enabled", True)):
+        return False
+    if str(left.get("hit_timing_profile", "default")) != str(right.get("hit_timing_profile", "default")):
         return False
     numeric_keys = (
         "smoothing_alpha",
@@ -898,7 +932,7 @@ def save_awac_artifacts(
     save_awac_state(AWAC_STATE_PATH, state)
 
 
-def parse_args():
+def build_train_awac_arg_parser():
     parser = argparse.ArgumentParser(description="AWAC bootstrap trainer for CyberNoodles.")
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--num-envs", type=int, default=0)
@@ -944,6 +978,30 @@ def parse_args():
     parser.add_argument("--strict-expand-accuracy", type=float, default=8.0)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--eval-envs", type=int, default=24)
+    parser.set_defaults(eval_cuda_graph=False)
+    parser.add_argument(
+        "--eval-cuda-graph",
+        dest="eval_cuda_graph",
+        action="store_true",
+        help="Opt into CUDA graph capture for AWAC preflight, baseline, and periodic evals.",
+    )
+    parser.add_argument(
+        "--no-eval-cuda-graph",
+        dest="eval_cuda_graph",
+        action="store_false",
+        help="Use eager eval loops for AWAC preflight, baseline, and periodic evals.",
+    )
+    parser.add_argument(
+        "--require-eval-cuda-graph",
+        action="store_true",
+        help="Fail AWAC eval instead of falling back if CUDA graph capture is unsupported.",
+    )
+    parser.add_argument(
+        "--eval-cuda-graph-done-check-interval-frames",
+        type=int,
+        default=0,
+        help="Optional graph-mode done check interval for AWAC eval. 0 runs each map for its full frame budget.",
+    )
     parser.add_argument("--bootstrap-map-count", type=int, default=3)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--strict-rollback-frac", type=float, default=0.5)
@@ -952,7 +1010,26 @@ def parse_args():
     parser.add_argument("--base-model", type=str, default=BC_MODEL_PATH)
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--allow-cold-start", action="store_true", help="Skip the BC bootstrap preflight check and allow AWAC to start from a dead warmstart.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--skip-bootstrap-preflight",
+        action="store_true",
+        help="Skip bootstrap/resume preflight evals. Requires --allow-cold-start.",
+    )
+    parser.add_argument(
+        "--skip-baseline-eval",
+        action="store_true",
+        help="Skip baseline strict/matched evals before epoch 1; best checkpoint selection starts at the first scheduled eval.",
+    )
+    parser.add_argument(
+        "--skip-initial-eval",
+        action="store_true",
+        help="Do not force an eval after epoch 1; use only --eval-every scheduling.",
+    )
+    return parser
+
+
+def parse_args(argv=None):
+    return build_train_awac_arg_parser().parse_args(argv)
 
 
 def train_awac(args=None):
@@ -976,6 +1053,13 @@ def train_awac(args=None):
     print(f"\033[96m{'=' * 68}\033[0m")
     print(f"Device: {device} | Envs: {args.num_envs} | Rollout steps: {args.rollout_steps}")
     print(f"Replay: {args.buffer_capacity:,} | Batch: {args.batch_size:,}")
+    graph_mode = (
+        "required" if bool(args.require_eval_cuda_graph)
+        else ("requested" if bool(args.eval_cuda_graph) else "off")
+    )
+    print(f"Eval CUDA graph: {graph_mode}")
+    if bool(args.skip_bootstrap_preflight) and not bool(args.allow_cold_start):
+        raise RuntimeError("--skip-bootstrap-preflight requires --allow-cold-start.")
 
     curriculum = load_curriculum_records()
     replay_backed_hashes = load_replay_backed_hashes()
@@ -1060,6 +1144,7 @@ def train_awac(args=None):
         "survival_assistance": float(matched_tuning.survival_assistance),
         "stability_reward_level": float(matched_tuning.stability_assistance),
         "style_guidance_level": float(matched_tuning.style_guidance_level),
+        "hit_timing_profile": str(matched_tuning.hit_timing_profile),
         "fail_enabled": bool(matched_tuning.fail_enabled),
         "saber_inertia": float(matched_tuning.saber_inertia),
         "rot_clamp": float(matched_tuning.rot_clamp),
@@ -1068,7 +1153,7 @@ def train_awac(args=None):
     matched_profile_is_strict = eval_profiles_match(matched_profile, strict_profile)
 
     preflight_hashes = eval_hashes[: max(1, min(len(eval_hashes), int(args.bootstrap_map_count)))]
-    if preflight_hashes:
+    if should_run_awac_preflight(preflight_hashes, args.skip_bootstrap_preflight):
         checkpoint_label = "resume" if resume_payload is not None else "bootstrap"
         print(f"Running AWAC {checkpoint_label} preflight...")
         preflight_meta_by_hash = {
@@ -1119,8 +1204,10 @@ def train_awac(args=None):
                 "Rebuild the BC shards, retrain BC, and verify strict closed-loop play moves off the floor before AWAC. "
                 "Use --allow-cold-start only if you explicitly want to bypass that gate."
             )
+    elif args.skip_bootstrap_preflight:
+        print("Skipping AWAC bootstrap preflight evals.")
 
-    if best_eval_key is None:
+    if should_run_awac_baseline_eval(best_eval_key, args.skip_baseline_eval):
         print("Running AWAC baseline strict eval for checkpoint selection...")
         baseline_strict = run_eval(actor, device, eval_hashes, map_cache, args, "baseline-strict", strict_profile)
         if matched_profile_is_strict:
@@ -1145,6 +1232,8 @@ def train_awac(args=None):
         print("  Seeding best AWAC actor from baseline strict eval.")
         save_awac_actor_model(actor)
         save_awac_state(AWAC_STATE_PATH, trainer_state)
+    elif best_eval_key is None and args.skip_baseline_eval:
+        print("Skipping AWAC baseline eval; best checkpoint selection starts at the first scheduled eval.")
 
     last_pool_stage = None
     for epoch in range(start_epoch, int(args.epochs)):
@@ -1359,7 +1448,7 @@ def train_awac(args=None):
             f"{epoch_seconds:.2f}s"
         )
 
-        should_eval = int(args.eval_every) > 0 and (((epoch + 1) % int(args.eval_every) == 0) or epoch == 0)
+        should_eval = should_run_awac_epoch_eval(epoch, args.eval_every, args.skip_initial_eval)
         if should_eval:
             actor.eval()
             strict_summary = run_eval(actor, device, eval_hashes, map_cache, args, "strict", strict_profile)

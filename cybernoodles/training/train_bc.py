@@ -63,7 +63,7 @@ LEGACY_Y_PATH = os.path.join(OUTPUT_DIR, "y_rl.pt")
 BC_MODEL_PATH = "bsai_bc_model.pth"
 BC_LAST_MODEL_PATH = "bsai_bc_last.pth"
 SIM_NOTE_TIME_MIN_BEATS = -1.0
-SIM_NOTE_TIME_MAX_BEATS = 4.0
+SIM_NOTE_TIME_MAX_BEATS = 8.0
 SIM_OBSTACLE_TIME_MIN_BEATS = -1.0
 SIM_OBSTACLE_TIME_MAX_BEATS = 6.0
 DEFAULT_BC_SIM_PROBE_MAPS = DEFAULT_BC_PROBE_MAPS
@@ -100,6 +100,15 @@ BC_LOSS_PRESETS = {
         "swing": 0.95,
         "note": 0.65,
         "direction": 0.00,
+    },
+    "contact_cut": {
+        "pos": 0.95,
+        "motion": 0.55,
+        "rot": 0.18,
+        "tip": 0.90,
+        "swing": 1.05,
+        "note": 1.20,
+        "direction": 0.25,
     },
     "cut": {
         "pos": 0.85,
@@ -181,10 +190,24 @@ def take_record_subset(records, limit, seed=1337):
     return subset
 
 
-def preflight_shard_records(records, split_label, shard_root=SHARD_ROOT, max_errors=8):
+def preflight_shard_records(
+    records,
+    split_label,
+    shard_root=SHARD_ROOT,
+    max_errors=8,
+    progress_every=250,
+    progress_seconds=30.0,
+):
     checked = 0
     samples = 0
     errors = []
+    total = len(records)
+    progress_every = max(1, int(progress_every))
+    progress_seconds = max(0.0, float(progress_seconds))
+    started = time.perf_counter()
+    last_progress = started
+    if total:
+        print(f"BC shard preflight {split_label}: checking {total} shard(s)...", flush=True)
     for record in records:
         try:
             info = validate_shard_record(
@@ -192,7 +215,8 @@ def preflight_shard_records(records, split_label, shard_root=SHARD_ROOT, max_err
                 shard_root,
                 expected_feature_dim=INPUT_DIM,
                 expected_target_dim=POSE_DIM,
-                expected_dtype=torch.float16,
+                expected_feature_dtype=torch.float16,
+                expected_target_dtype=torch.float32,
             )
             checked += 1
             samples += int(info["samples"])
@@ -201,6 +225,23 @@ def preflight_shard_records(records, split_label, shard_root=SHARD_ROOT, max_err
             errors.append(f"{split_label}:{label}: {exc}")
             if len(errors) >= max_errors:
                 break
+        now = time.perf_counter()
+        if checked and (
+            checked == total
+            or checked % progress_every == 0
+            or (progress_seconds > 0.0 and (now - last_progress) >= progress_seconds)
+        ):
+            elapsed = max(1e-6, now - started)
+            rate = checked / elapsed
+            remaining = max(0, total - checked)
+            eta_seconds = remaining / rate if rate > 0.0 else float("inf")
+            eta_text = f"{eta_seconds / 60.0:.1f}m" if math.isfinite(eta_seconds) else "unknown"
+            print(
+                f"BC shard preflight {split_label}: {checked}/{total} shard(s), "
+                f"{samples:,} samples, ETA {eta_text}",
+                flush=True,
+            )
+            last_progress = now
 
     if errors:
         detail = "\n  - ".join(errors)
@@ -321,6 +362,7 @@ def run_bc_sim_probe(
     suite="starter",
     profile="strict",
     verbose=False,
+    use_cuda_graph=False,
 ):
     curriculum = load_curriculum()
     if not curriculum:
@@ -342,6 +384,7 @@ def run_bc_sim_probe(
         noise_scale=0.0,
         label="bc-probe",
         verbose=verbose,
+        use_cuda_graph=use_cuda_graph,
         **probe_cfg,
     )
 
@@ -434,6 +477,14 @@ def should_save_bc_last_checkpoint(sim_probe, candidate_probe_key, best_probe_ke
     if candidate_probe_key is None or best_probe_key is None:
         return True
     return not bc_probe_key_has_regressed(candidate_probe_key, best_probe_key)
+
+
+def should_run_bc_baseline_eval(val_records):
+    return bool(val_records)
+
+
+def should_run_bc_baseline_sim_probe(sim_probe, sim_probe_baseline):
+    return bool(sim_probe and sim_probe_baseline)
 
 
 def _relevant_saber_tip(left_tip, right_tip, note_type):
@@ -1103,6 +1154,8 @@ def train_bc(
     sim_probe_profile="strict",
     sim_probe_suite="starter",
     sim_probe_verbose=False,
+    sim_probe_baseline=False,
+    sim_probe_cuda_graph=False,
     profile_loader=False,
     loader_prefetch_batches=DEFAULT_LOADER_PREFETCH_BATCHES,
     loader_prefetch_shards=DEFAULT_LOADER_PREFETCH_SHARDS,
@@ -1220,7 +1273,7 @@ def train_bc(
     stale_epochs = 0
     baseline_eval = None
     baseline_suffix = ""
-    if val_records:
+    if should_run_bc_baseline_eval(val_records):
         baseline_profile = LoaderProfile(enabled=profile_loader)
         baseline_started = time.perf_counter()
         baseline_eval = evaluate_model(
@@ -1248,7 +1301,7 @@ def train_bc(
             if profile_loader:
                 print_loader_profile("val-baseline", baseline_profile, baseline_elapsed, device)
 
-    if sim_probe:
+    if should_run_bc_baseline_sim_probe(sim_probe, sim_probe_baseline):
         baseline_probe_stats = run_bc_sim_probe(
             model,
             device,
@@ -1257,6 +1310,7 @@ def train_bc(
             suite=sim_probe_suite,
             profile=sim_probe_profile,
             verbose=sim_probe_verbose,
+            use_cuda_graph=sim_probe_cuda_graph,
         )
         if baseline_probe_stats is not None:
             best_probe_key = probe_sort_key(baseline_probe_stats, baseline_eval)
@@ -1275,6 +1329,8 @@ def train_bc(
                 f"clear {baseline_probe_stats['mean_clear_rate']:.2f}"
             )
             print(baseline_suffix)
+    elif sim_probe:
+        print("Skipping baseline simulator probe before epoch 1 (--sim-probe-baseline not set); epoch-end simulator probes remain enabled.")
 
     last_checkpoint_saved = False
     for epoch in range(epochs):
@@ -1376,6 +1432,7 @@ def train_bc(
                 suite=sim_probe_suite,
                 profile=sim_probe_profile,
                 verbose=sim_probe_verbose,
+                use_cuda_graph=sim_probe_cuda_graph,
             )
 
         raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1480,51 +1537,60 @@ def train_bc(
         print(f"{DIM}Latest checkpoint was not updated because probed epochs regressed.{RST}")
 
 
+def build_train_bc_arg_parser():
+    parser = argparse.ArgumentParser(description="Train the CyberNoodles BC warmstart.")
+    parser.add_argument("legacy_epochs", nargs="?", type=int, help="Backward-compatible positional epochs override.")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of full passes over the selected BC shards.")
+    parser.add_argument("--batch-size", type=int, default=None, help="BC minibatch size. Defaults to an automatic GPU-aware choice.")
+    parser.add_argument("--lr", type=float, default=8e-4, help="Learning rate.")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience in stale evals.")
+    parser.add_argument("--train-shards", type=int, default=None, help="Use only this many training shards for faster iteration.")
+    parser.add_argument("--val-shards", type=int, default=None, help="Use only this many validation shards for faster iteration.")
+    parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs.")
+    parser.add_argument("--val-batches", type=int, default=None, help="Cap each validation pass to this many batches.")
+    parser.add_argument("--init-from", type=str, default=None, help="Warm-start from an existing checkpoint path, or `best` / `last`.")
+    parser.add_argument(
+        "--loss-preset",
+        choices=sorted(BC_LOSS_PRESETS),
+        default="cut",
+        help="BC objective weighting preset. `contact_cut` preserves contact pressure while restoring cut direction.",
+    )
+    parser.add_argument("--sim-probe", dest="sim_probe", action="store_true", help="Run simulator probes after evals and select best checkpoints on probe metrics.")
+    parser.add_argument("--no-sim-probe", dest="sim_probe", action="store_false", help="Disable simulator probes and fall back to shard-loss-only checkpoint selection.")
+    parser.add_argument("--sim-probe-baseline", dest="sim_probe_baseline", action="store_true", help="Also run the baseline simulator probe before epoch 1.")
+    parser.add_argument("--no-sim-probe-baseline", dest="sim_probe_baseline", action="store_false", help="Skip the baseline simulator probe before epoch 1.")
+    parser.add_argument("--sim-probe-cuda-graph", dest="sim_probe_cuda_graph", action="store_true", help="Opt into CUDA graph capture for supported simulator probes.")
+    parser.add_argument("--no-sim-probe-cuda-graph", dest="sim_probe_cuda_graph", action="store_false", help="Use the eager simulator loop for simulator probes.")
+    parser.add_argument("--sim-probe-maps", type=int, default=DEFAULT_BC_SIM_PROBE_MAPS, help="How many eval maps to use for the simulator probe.")
+    parser.add_argument("--sim-probe-num-envs", type=int, default=DEFAULT_BC_SIM_PROBE_ENVS, help="How many simulator envs to use for the probe.")
+    parser.add_argument("--sim-probe-profile", type=str, default="strict", help="Simulator probe profile: strict, bc, or rehab.")
+    parser.add_argument("--sim-probe-suite", type=str, default="starter", help="Curriculum suite for probe map selection.")
+    parser.add_argument("--sim-probe-verbose", action="store_true", help="Print simulator probe progress.")
+    parser.add_argument("--profile-loader", action="store_true", help="Print per-phase BC loader timing breakdowns.")
+    parser.add_argument(
+        "--loader-prefetch-batches",
+        type=int,
+        default=DEFAULT_LOADER_PREFETCH_BATCHES,
+        help="How many ready CPU batches to keep queued ahead of the training loop. Set 0 to disable async batch prefetch.",
+    )
+    parser.add_argument(
+        "--loader-prefetch-shards",
+        type=int,
+        default=DEFAULT_LOADER_PREFETCH_SHARDS,
+        help="How many shard load/shuffle tasks to keep in flight inside the BC batch producer.",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Fast sanity-check mode: fewer epochs, fewer shards, and cheaper validation.",
+    )
+    parser.set_defaults(sim_probe=True, sim_probe_baseline=False, sim_probe_cuda_graph=False)
+    return parser
+
+
 if __name__ == "__main__":
     try:
-        parser = argparse.ArgumentParser(description="Train the CyberNoodles BC warmstart.")
-        parser.add_argument("legacy_epochs", nargs="?", type=int, help="Backward-compatible positional epochs override.")
-        parser.add_argument("--epochs", type=int, default=None, help="Number of full passes over the selected BC shards.")
-        parser.add_argument("--batch-size", type=int, default=None, help="BC minibatch size. Defaults to an automatic GPU-aware choice.")
-        parser.add_argument("--lr", type=float, default=8e-4, help="Learning rate.")
-        parser.add_argument("--patience", type=int, default=3, help="Early stopping patience in stale evals.")
-        parser.add_argument("--train-shards", type=int, default=None, help="Use only this many training shards for faster iteration.")
-        parser.add_argument("--val-shards", type=int, default=None, help="Use only this many validation shards for faster iteration.")
-        parser.add_argument("--val-every", type=int, default=1, help="Run validation every N epochs.")
-        parser.add_argument("--val-batches", type=int, default=None, help="Cap each validation pass to this many batches.")
-        parser.add_argument("--init-from", type=str, default=None, help="Warm-start from an existing checkpoint path, or `best` / `last`.")
-        parser.add_argument(
-            "--loss-preset",
-            choices=sorted(BC_LOSS_PRESETS),
-            default="cut",
-            help="BC objective weighting preset. `cut` prioritizes saber-tip swing geometry for strict play.",
-        )
-        parser.add_argument("--sim-probe", dest="sim_probe", action="store_true", help="Run a tiny simulator probe after each eval and select best checkpoints on probe metrics.")
-        parser.add_argument("--no-sim-probe", dest="sim_probe", action="store_false", help="Disable simulator probes and fall back to shard-loss-only checkpoint selection.")
-        parser.add_argument("--sim-probe-maps", type=int, default=DEFAULT_BC_SIM_PROBE_MAPS, help="How many eval maps to use for the simulator probe.")
-        parser.add_argument("--sim-probe-num-envs", type=int, default=DEFAULT_BC_SIM_PROBE_ENVS, help="How many simulator envs to use for the probe.")
-        parser.add_argument("--sim-probe-profile", type=str, default="strict", help="Simulator probe profile: strict, bc, or rehab.")
-        parser.add_argument("--sim-probe-suite", type=str, default="starter", help="Curriculum suite for probe map selection.")
-        parser.add_argument("--sim-probe-verbose", action="store_true", help="Print simulator probe progress.")
-        parser.add_argument("--profile-loader", action="store_true", help="Print per-phase BC loader timing breakdowns.")
-        parser.add_argument(
-            "--loader-prefetch-batches",
-            type=int,
-            default=DEFAULT_LOADER_PREFETCH_BATCHES,
-            help="How many ready CPU batches to keep queued ahead of the training loop. Set 0 to disable async batch prefetch.",
-        )
-        parser.add_argument(
-            "--loader-prefetch-shards",
-            type=int,
-            default=DEFAULT_LOADER_PREFETCH_SHARDS,
-            help="How many shard load/shuffle tasks to keep in flight inside the BC batch producer.",
-        )
-        parser.add_argument(
-            "--quick",
-            action="store_true",
-            help="Fast sanity-check mode: fewer epochs, fewer shards, and cheaper validation.",
-        )
-        parser.set_defaults(sim_probe=True)
+        parser = build_train_bc_arg_parser()
         args = parser.parse_args()
 
         epochs = args.epochs if args.epochs is not None else (args.legacy_epochs if args.legacy_epochs is not None else 8)
@@ -1557,6 +1623,8 @@ if __name__ == "__main__":
             sim_probe_profile=args.sim_probe_profile,
             sim_probe_suite=args.sim_probe_suite,
             sim_probe_verbose=args.sim_probe_verbose,
+            sim_probe_baseline=args.sim_probe_baseline,
+            sim_probe_cuda_graph=args.sim_probe_cuda_graph,
             profile_loader=args.profile_loader,
             loader_prefetch_batches=args.loader_prefetch_batches,
             loader_prefetch_shards=args.loader_prefetch_shards,

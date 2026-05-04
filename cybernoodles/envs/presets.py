@@ -14,6 +14,7 @@ class SimulatorTuning:
     survival_assistance: float = 0.0
     stability_assistance: float = 0.0
     style_guidance_level: float = 0.0
+    hit_timing_profile: str = "default"
     fail_enabled: bool = True
     saber_inertia: float = 0.0
     rot_clamp: float = 0.07
@@ -30,6 +31,11 @@ def apply_simulator_tuning(sim, tuning: SimulatorTuning, indices=None):
     sim.set_dense_reward_scale(float(tuning.dense_reward_scale), indices=indices)
     sim.set_training_wheels(float(tuning.training_wheels))
     sim.set_rehab_assists(float(tuning.rehab_assists), indices=indices)
+    sim.set_hit_timing_profile(
+        tuning.hit_timing_profile,
+        assist_level=float(tuning.rehab_assists),
+        indices=indices,
+    )
     sim.set_survival_assistance(float(tuning.survival_assistance), indices=indices)
     sim.set_stability_assistance(float(tuning.stability_assistance), indices=indices)
     sim.set_style_guidance(float(tuning.style_guidance_level), indices=indices)
@@ -52,6 +58,7 @@ def get_eval_profile(profile):
                 survival_assistance=0.0,
                 stability_assistance=0.0,
                 style_guidance_level=0.0,
+                hit_timing_profile="strict",
                 fail_enabled=True,
                 saber_inertia=0.0,
                 rot_clamp=0.07,
@@ -67,6 +74,7 @@ def get_eval_profile(profile):
                 survival_assistance=0.65,
                 stability_assistance=0.0,
                 style_guidance_level=0.0,
+                hit_timing_profile="assisted",
                 fail_enabled=False,
                 saber_inertia=0.0,
                 rot_clamp=0.07,
@@ -82,6 +90,7 @@ def get_eval_profile(profile):
                 survival_assistance=1.0,
                 stability_assistance=0.0,
                 style_guidance_level=0.0,
+                hit_timing_profile="assisted",
                 fail_enabled=False,
                 saber_inertia=0.0,
                 rot_clamp=0.07,
@@ -100,6 +109,7 @@ def get_eval_profile(profile):
 
 
 def build_awac_training_tuning(args) -> SimulatorTuning:
+    assist_level = float(args.assist_level)
     return SimulatorTuning(
         penalty_weights=(
             float(args.w_miss),
@@ -109,10 +119,11 @@ def build_awac_training_tuning(args) -> SimulatorTuning:
         ),
         dense_reward_scale=float(args.dense_reward_scale),
         training_wheels=float(args.training_wheels_level),
-        rehab_assists=float(args.assist_level),
+        rehab_assists=assist_level,
         survival_assistance=float(args.survival_assistance),
         stability_assistance=float(args.stability_reward_level),
         style_guidance_level=float(args.style_guidance_level),
+        hit_timing_profile="assisted" if assist_level > 0.0 else "default",
         fail_enabled=bool(args.fail_enabled),
         saber_inertia=float(args.saber_inertia),
         rot_clamp=float(args.rot_clamp),
