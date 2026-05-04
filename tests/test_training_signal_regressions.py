@@ -1,4 +1,5 @@
 import os
+import math
 import tempfile
 import unittest
 from argparse import Namespace
@@ -16,8 +17,10 @@ from cybernoodles.training.policy_eval import (
     sample_policy_action,
 )
 from cybernoodles.training.train_awac import (
+    awac_eval_cuda_graph_kwargs,
     awac_eval_key_has_regressed,
     bootstrap_has_play_signal,
+    build_train_awac_arg_parser,
     choose_training_stage,
     eval_profiles_match,
     format_eval_signal,
@@ -25,6 +28,9 @@ from cybernoodles.training.train_awac import (
     normalize_rollout_metrics,
     save_awac_artifacts,
     seed_awac_best_eval_key,
+    should_run_awac_baseline_eval,
+    should_run_awac_epoch_eval,
+    should_run_awac_preflight,
     update_trainer_state_from_eval,
 )
 from cybernoodles.training.train_rl_gpu import (
@@ -42,11 +48,17 @@ from cybernoodles.training.train_rl_gpu import (
 )
 from cybernoodles.training.train_bc import (
     BC_LOSS_PRESETS,
+    bc_pose_loss,
     bc_probe_key_has_regressed,
+    build_train_bc_arg_parser,
+    project_bc_pose_action_to_executed_pose,
     probe_sort_key,
     resolve_bc_loss_weights,
     sample_weights_from_state,
+    save_bc_last_checkpoint_if_allowed,
     saber_tip_direction_loss,
+    should_run_bc_baseline_eval,
+    should_run_bc_baseline_sim_probe,
     should_save_bc_last_checkpoint,
 )
 
@@ -73,6 +85,18 @@ TEST_BEATMAP = {
 
 
 class TrainingSignalRegressionTests(unittest.TestCase):
+    def _make_bc_state(self, batch=1):
+        state = torch.zeros((batch, INPUT_DIM), dtype=torch.float32)
+        pose = state[:, CURRENT_POSE_START:CURRENT_POSE_START + 21]
+        pose[:, 3] = 0.0
+        pose[:, 6] = 1.0
+        pose[:, 10] = 0.0
+        pose[:, 13] = 1.0
+        pose[:, 17] = 0.0
+        pose[:, 20] = 1.0
+        state[:, NOTE_TYPE_INDEX] = -1.0
+        return state
+
     def _make_sim(self):
         env = make_vector_env(
             num_envs=1,
@@ -141,6 +165,38 @@ class TrainingSignalRegressionTests(unittest.TestCase):
 
         self.assertLess(float(correct_loss.item()), 0.05)
         self.assertGreater(float(wrong_loss.item()), 1.5)
+
+    def test_bc_executed_projection_caps_first_frame_hand_movement_from_rest(self):
+        state = self._make_bc_state()
+        action = state[:, CURRENT_POSE_START:CURRENT_POSE_START + 21].clone()
+        action[:, 7] = 0.12
+
+        executed = project_bc_pose_action_to_executed_pose(action, state)
+
+        self.assertAlmostEqual(float(executed[0, 7].item()), 0.62 * 0.12, places=6)
+
+    def test_bc_executed_projection_preserves_head_inertia_contract(self):
+        state = self._make_bc_state()
+        action = state[:, CURRENT_POSE_START:CURRENT_POSE_START + 21].clone()
+        action[:, 0] = 0.08
+
+        executed = project_bc_pose_action_to_executed_pose(action, state)
+
+        self.assertAlmostEqual(float(executed[0, 0].item()), 0.08 * (0.20 + 0.55 * 0.78), places=6)
+
+    def test_bc_pose_loss_compares_executed_pose_under_acceleration_saturation(self):
+        state = self._make_bc_state()
+        current_pose = state[:, CURRENT_POSE_START:CURRENT_POSE_START + 21]
+        pred = current_pose.clone()
+        target = current_pose.clone()
+        pred[:, 7] = 0.62 * 0.12
+        target[:, 7] = 0.12
+
+        loss, metrics = bc_pose_loss(pred, target, state)
+
+        self.assertLess(float(loss.item()), 1e-7)
+        self.assertLess(metrics["pos"], 1e-7)
+        self.assertLess(metrics["motion"], 1e-7)
 
     def test_bc_probe_key_keeps_baseline_above_collapsed_lower_val_loss(self):
         baseline_key = probe_sort_key(
@@ -244,17 +300,66 @@ class TrainingSignalRegressionTests(unittest.TestCase):
         self.assertTrue(should_save_bc_last_checkpoint(True, None, best_key))
         self.assertTrue(should_save_bc_last_checkpoint(True, collapsed_key, None))
 
+    def test_bc_last_checkpoint_artifact_save_respects_probe_regression(self):
+        best_key = (1, 1, 0.060, 0.140, 0.0, 3.20, 24.0, 48.0, 0.040, 0.030, -0.50)
+        collapsed_key = (0, 0, 0.002, 0.020, 0.0, 0.20, 5.0, 20.0, 0.001, 0.001, -0.01)
+        mild_drift_key = (1, 1, 0.055, 0.132, 0.0, 3.00, 23.0, 47.0, 0.038, 0.028, -0.01)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            last_path = os.path.join(tmpdir, "bc_last.pth")
+            saved_paths = []
+
+            def _fake_torch_save(payload, path):
+                saved_paths.append(path)
+
+            with mock.patch("cybernoodles.training.train_bc.torch.save", side_effect=_fake_torch_save):
+                saved = save_bc_last_checkpoint_if_allowed(
+                    last_path,
+                    {"w": torch.tensor([1.0])},
+                    True,
+                    collapsed_key,
+                    best_key,
+                )
+                self.assertFalse(saved)
+                self.assertEqual(saved_paths, [])
+
+                saved = save_bc_last_checkpoint_if_allowed(
+                    last_path,
+                    {"w": torch.tensor([1.0])},
+                    True,
+                    mild_drift_key,
+                    best_key,
+                )
+                self.assertTrue(saved)
+                self.assertEqual(saved_paths, [last_path])
+
     def test_bc_cut_preset_keeps_pose_note_anchors_and_rejects_unknowns(self):
         balanced = BC_LOSS_PRESETS["balanced"]
+        contact_cut = resolve_bc_loss_weights("contact_cut")
         cut = resolve_bc_loss_weights("cut")
 
+        self.assertEqual(set(balanced), set(cut))
         self.assertGreater(cut["tip"], balanced["tip"])
         self.assertGreater(cut["swing"], balanced["swing"])
         self.assertGreaterEqual(cut["pos"], 0.75)
         self.assertGreaterEqual(cut["motion"], balanced["motion"])
-        self.assertGreaterEqual(cut["note"], balanced["note"])
-        self.assertLess(cut["direction"], cut["note"])
+        self.assertGreaterEqual(cut["direction"], cut["note"])
         self.assertLess(cut["direction"], cut["tip"])
+        self.assertEqual(set(balanced), set(contact_cut))
+        self.assertGreater(contact_cut["note"], balanced["note"])
+        self.assertGreater(contact_cut["note"], cut["note"])
+        self.assertGreater(contact_cut["direction"], balanced["direction"])
+        self.assertLess(contact_cut["direction"], cut["direction"])
+        self.assertLess(contact_cut["swing"], cut["swing"])
+        self.assertLess(contact_cut["tip"], cut["tip"])
+        for preset in BC_LOSS_PRESETS.values():
+            self.assertEqual(set(preset), set(balanced))
+            for value in preset.values():
+                self.assertTrue(math.isfinite(value))
+                self.assertGreaterEqual(value, 0.0)
+
+        cut["note"] = 99.0
+        self.assertNotEqual(cut["note"], BC_LOSS_PRESETS["cut"]["note"])
 
         with self.assertRaisesRegex(ValueError, "Unknown BC loss preset"):
             resolve_bc_loss_weights("unknown")
@@ -302,7 +407,7 @@ class TrainingSignalRegressionTests(unittest.TestCase):
         self.assertEqual(awac_path, "bsai_awac_model.pth")
         self.assertEqual(awac_label, "AWAC bootstrap")
 
-    def test_default_awac_matched_profile_matches_strict_profile(self):
+    def test_awac_matched_profile_requires_explicit_strict_timing(self):
         strict_profile = get_eval_profile("strict")
         args = Namespace(
             training_wheels_level=0.0,
@@ -328,6 +433,9 @@ class TrainingSignalRegressionTests(unittest.TestCase):
             "rot_clamp": float(args.rot_clamp),
             "pos_clamp": float(args.pos_clamp),
         }
+        self.assertFalse(eval_profiles_match(strict_profile, matched_profile))
+
+        matched_profile["hit_timing_profile"] = "strict"
         self.assertTrue(eval_profiles_match(strict_profile, matched_profile))
 
         matched_profile["assist_level"] = 0.1
@@ -579,6 +687,92 @@ class TrainingSignalRegressionTests(unittest.TestCase):
         self.assertFalse(should_run_epoch_eval_probe(1, 100, ["a"], skip_initial_eval=False))
         self.assertTrue(should_run_epoch_eval_probe(99, 100, ["a"], skip_initial_eval=True))
         self.assertFalse(should_run_epoch_eval_probe(99, 100, [], skip_initial_eval=False))
+
+    def test_bc_baseline_eval_is_independent_from_sim_probe_baseline_flag(self):
+        self.assertTrue(should_run_bc_baseline_eval([object()]))
+        self.assertFalse(should_run_bc_baseline_eval([]))
+
+        self.assertFalse(should_run_bc_baseline_sim_probe(sim_probe=True, sim_probe_baseline=False))
+        self.assertFalse(should_run_bc_baseline_sim_probe(sim_probe=False, sim_probe_baseline=True))
+        self.assertTrue(should_run_bc_baseline_sim_probe(sim_probe=True, sim_probe_baseline=True))
+
+    def test_bc_sim_probe_baseline_cli_defaults_to_skip(self):
+        parser = build_train_bc_arg_parser()
+
+        default_args = parser.parse_args(["--sim-probe"])
+        self.assertTrue(default_args.sim_probe)
+        self.assertFalse(default_args.sim_probe_baseline)
+        self.assertFalse(should_run_bc_baseline_sim_probe(default_args.sim_probe, default_args.sim_probe_baseline))
+
+        explicit_args = parser.parse_args(["--sim-probe", "--sim-probe-baseline"])
+        self.assertTrue(should_run_bc_baseline_sim_probe(explicit_args.sim_probe, explicit_args.sim_probe_baseline))
+
+        disabled_args = parser.parse_args(["--no-sim-probe", "--sim-probe-baseline"])
+        self.assertFalse(should_run_bc_baseline_sim_probe(disabled_args.sim_probe, disabled_args.sim_probe_baseline))
+
+    def test_awac_eval_cuda_graph_cli_defaults_to_eager_and_can_require_graph(self):
+        parser = build_train_awac_arg_parser()
+
+        default_args = parser.parse_args([])
+        self.assertFalse(default_args.eval_cuda_graph)
+        self.assertFalse(default_args.require_eval_cuda_graph)
+        self.assertEqual(
+            awac_eval_cuda_graph_kwargs(default_args),
+            {
+                "use_cuda_graph": False,
+                "require_cuda_graph": False,
+                "cuda_graph_done_check_interval_frames": 0,
+            },
+        )
+
+        requested_args = parser.parse_args([
+            "--eval-cuda-graph",
+            "--eval-cuda-graph-done-check-interval-frames",
+            "7",
+        ])
+        self.assertEqual(
+            awac_eval_cuda_graph_kwargs(requested_args),
+            {
+                "use_cuda_graph": True,
+                "require_cuda_graph": False,
+                "cuda_graph_done_check_interval_frames": 7,
+            },
+        )
+
+        required_args = parser.parse_args(["--require-eval-cuda-graph"])
+        self.assertEqual(
+            awac_eval_cuda_graph_kwargs(required_args),
+            {
+                "use_cuda_graph": True,
+                "require_cuda_graph": True,
+                "cuda_graph_done_check_interval_frames": 0,
+            },
+        )
+
+    def test_awac_startup_eval_skip_flags_are_explicit(self):
+        parser = build_train_awac_arg_parser()
+
+        default_args = parser.parse_args([])
+        self.assertFalse(default_args.skip_bootstrap_preflight)
+        self.assertFalse(default_args.skip_baseline_eval)
+        self.assertFalse(default_args.skip_initial_eval)
+        self.assertTrue(should_run_awac_preflight(["map"], default_args.skip_bootstrap_preflight))
+        self.assertTrue(should_run_awac_baseline_eval(None, default_args.skip_baseline_eval))
+        self.assertFalse(should_run_awac_baseline_eval((1, 0.1), default_args.skip_baseline_eval))
+        self.assertTrue(should_run_awac_epoch_eval(0, 5, default_args.skip_initial_eval))
+        self.assertTrue(should_run_awac_epoch_eval(4, 5, default_args.skip_initial_eval))
+        self.assertFalse(should_run_awac_epoch_eval(1, 5, default_args.skip_initial_eval))
+
+        skip_args = parser.parse_args([
+            "--skip-bootstrap-preflight",
+            "--skip-baseline-eval",
+            "--skip-initial-eval",
+        ])
+        self.assertFalse(should_run_awac_preflight(["map"], skip_args.skip_bootstrap_preflight))
+        self.assertFalse(should_run_awac_baseline_eval(None, skip_args.skip_baseline_eval))
+        self.assertFalse(should_run_awac_epoch_eval(0, 5, skip_args.skip_initial_eval))
+        self.assertTrue(should_run_awac_epoch_eval(4, 5, skip_args.skip_initial_eval))
+        self.assertFalse(should_run_awac_epoch_eval(4, 0, skip_args.skip_initial_eval))
 
     def test_live_training_signal_prefers_current_progress_over_historical_best(self):
         adaptive_state = {

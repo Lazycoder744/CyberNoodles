@@ -7,17 +7,90 @@ import zipfile
 from unittest import mock
 
 import numpy as np
+import torch
 
 from cybernoodles.replay.generate_replay import (
     NOTE_EVENT_GOOD,
     NOTE_EVENT_MISS,
     _build_bsor_from_events,
+    _choose_top_replay_candidates,
+    _make_candidate_action_bias,
+    _resolve_generation_candidate_counts,
     _select_primary_info_file,
+    build_replay_generation_arg_parser,
     robust_get_notes,
 )
 
 
 class ReplayGenerationCpuPathTests(unittest.TestCase):
+    def test_cuda_graph_generation_cli_exposes_candidate_controls(self):
+        parser = build_replay_generation_arg_parser()
+        args = parser.parse_args([
+            "abc123",
+            "model.pth",
+            "out.bsor",
+            "--cuda-graph",
+            "--candidates",
+            "512",
+            "--top-k",
+            "4",
+            "--candidate-seed",
+            "99",
+        ])
+
+        self.assertTrue(args.cuda_graph)
+        self.assertEqual(args.candidates, 512)
+        self.assertEqual(args.top_k, 4)
+        self.assertEqual(args.candidate_seed, 99)
+
+    def test_generation_candidate_count_resolution_caps_top_k(self):
+        device = torch.device("cpu")
+
+        recording_envs, candidate_envs, rerun_envs = _resolve_generation_candidate_counts(
+            num_envs=8,
+            candidates=64,
+            top_k=128,
+            device=device,
+        )
+
+        self.assertEqual(recording_envs, 8)
+        self.assertEqual(candidate_envs, 64)
+        self.assertEqual(rerun_envs, 64)
+
+    def test_candidate_action_bias_is_zero_without_noise_and_seeded_with_noise(self):
+        device = torch.device("cpu")
+
+        no_noise = _make_candidate_action_bias(3, device, 0.0, 123)
+        first = _make_candidate_action_bias(3, device, 0.5, 123)
+        second = _make_candidate_action_bias(3, device, 0.5, 123)
+
+        self.assertTrue(torch.equal(no_noise, torch.zeros_like(no_noise)))
+        self.assertTrue(torch.equal(first, second))
+        self.assertGreater(float(first.abs().sum().item()), 0.0)
+
+    def test_top_replay_candidates_use_disciplined_rank_not_raw_score_only(self):
+        class FakeSim:
+            pass
+
+        sim = FakeSim()
+        sim.total_scores = torch.tensor([100.0, 98.0, 70.0])
+        sim.total_hits = torch.tensor([10.0, 9.0, 5.0])
+        sim.speed_samples = torch.ones(3)
+        sim.speed_violation_sum = torch.zeros(3)
+        sim.angular_violation_sum = torch.zeros(3)
+        sim.waste_motion_sum = torch.zeros(3)
+        sim.idle_motion_sum = torch.zeros(3)
+        sim.guard_error_sum = torch.zeros(3)
+        sim.oscillation_sum = torch.zeros(3)
+        sim.lateral_motion_sum = torch.zeros(3)
+        sim.useful_progress = torch.tensor([0.1, 0.9, 1.0])
+        sim.motion_path = torch.ones(3)
+
+        top_indices, strategy = _choose_top_replay_candidates(sim, 2)
+
+        self.assertEqual(top_indices.tolist(), [1, 0])
+        self.assertEqual(strategy, "disciplined-top-2")
+
     def test_build_bsor_from_events_normalizes_frames_and_preserves_event_counts(self):
         beatmap = {
             "song_name": "Unit Test Song",

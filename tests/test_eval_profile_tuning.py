@@ -42,6 +42,7 @@ def _build_eval_kwargs(profile_name):
         "survival_assistance": profile["survival_assistance"],
         "stability_assistance": profile["stability_reward_level"],
         "style_guidance_level": profile["style_guidance_level"],
+        "hit_timing_profile": profile["hit_timing_profile"],
         "fail_enabled": profile["fail_enabled"],
         "saber_inertia": profile["saber_inertia"],
         "rot_clamp": profile["rot_clamp"],
