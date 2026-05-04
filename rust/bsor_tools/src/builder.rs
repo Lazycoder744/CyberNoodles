@@ -21,7 +21,7 @@ use zip::ZipArchive;
 use crate::io::read_bsor_path;
 use crate::sanitize::{dataset_view, DatasetFrame};
 
-const MANIFEST_VERSION: u32 = 15;
+const MANIFEST_VERSION: u32 = 16;
 const MANIFEST_SEMANTIC_SCHEMA_ID: &str = "bc-shard-semantics-v1";
 const NOTE_LOOKAHEAD_BEATS: f32 = 1.25;
 const FOLLOWTHROUGH_BEATS: f32 = 0.35;
@@ -34,6 +34,8 @@ const SIM_SAMPLE_HZ: f32 = 60.0;
 const SIM_SAMPLE_DT: f32 = 1.0 / SIM_SAMPLE_HZ;
 const SIM_NOTE_TIME_MIN_BEATS: f32 = -1.0;
 const SIM_NOTE_TIME_MAX_BEATS: f32 = 4.0;
+const NOTE_TIME_FEATURE_MIN_BEATS: f32 = -1.0;
+const NOTE_TIME_FEATURE_MAX_BEATS: f32 = 8.0;
 const SIM_OBSTACLE_TIME_MIN_BEATS: f32 = -1.0;
 const SIM_OBSTACLE_TIME_MAX_BEATS: f32 = 6.0;
 const NOTE_FEATURE_LAYOUT: &str =
@@ -60,12 +62,14 @@ const SCORE_CLASS_ARC_HEAD: f32 = 1.0;
 const SCORE_CLASS_ARC_TAIL: f32 = 2.0;
 const SCORE_CLASS_CHAIN_HEAD: f32 = 3.0;
 const SCORE_CLASS_CHAIN_LINK: f32 = 4.0;
-const SHARD_STORAGE_DTYPE: &str = "float16";
 const ACTION_ABS_COMPONENT_LIMIT: f32 = 2.0;
+const STATE_POSE_POSITION_ABS_LIMIT: f32 = ACTION_ABS_COMPONENT_LIMIT;
+const FEATURE_STORAGE_DTYPE: &str = "float16";
+const TARGET_STORAGE_DTYPE: &str = "float32";
+const SHARD_STORAGE_DTYPE: &str = "features=float16,targets=float32";
 const TARGET_ACTION_DELTA_CLAMP: [f32; POSE_DIM] = [
-    0.08, 0.08, 0.08, 0.045, 0.045, 0.045, 0.045,
-    0.12, 0.12, 0.12, 0.07, 0.07, 0.07, 0.07,
-    0.12, 0.12, 0.12, 0.07, 0.07, 0.07, 0.07,
+    0.08, 0.08, 0.08, 0.045, 0.045, 0.045, 0.045, 0.12, 0.12, 0.12, 0.07, 0.07, 0.07, 0.07, 0.12,
+    0.12, 0.12, 0.07, 0.07, 0.07, 0.07,
 ];
 
 #[derive(Debug, Clone)]
@@ -163,6 +167,8 @@ struct ManifestSemanticSchema {
     background_frame_stride: usize,
     target_pose_horizon_frames: usize,
     sim_note_time_range_beats: Vec<f32>,
+    #[serde(default)]
+    note_time_feature_range_beats: Vec<f32>,
     sim_obstacle_time_range_beats: Vec<f32>,
     num_upcoming_notes: usize,
     note_features: usize,
@@ -172,6 +178,8 @@ struct ManifestSemanticSchema {
     velocity_dim: usize,
     track_z_base: f32,
     shard_storage_dtype: String,
+    #[serde(default)]
+    feature_storage_dtype: String,
     action_contract: ManifestActionContract,
     target_contract: ManifestTargetContract,
     sentinel_contract: ManifestSentinelContract,
@@ -693,7 +701,10 @@ pub fn build_bc_dataset(args: BuildBcDatasetArgs) -> Result<()> {
             "{} selected replay(s) are missing locally and will not be built.",
             missing_selected.len()
         );
-        println!("Warning: {message} {}", replay_preview(&missing_selected, 5));
+        println!(
+            "Warning: {message} {}",
+            replay_preview(&missing_selected, 5)
+        );
         manifest_dirty |= set_manifest_warning(
             &mut manifest,
             ManifestWarning {
@@ -710,22 +721,14 @@ pub fn build_bc_dataset(args: BuildBcDatasetArgs) -> Result<()> {
         save_manifest(&manifest, &manifest_path)?;
     }
     let done_set: HashSet<_> = manifest.done.iter().cloned().collect();
-    let failed_set: HashSet<_> = manifest.failed.iter().cloned().collect();
-    let remaining: Vec<_> = replay_files
-        .into_iter()
-        .filter(|path| {
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                return false;
-            };
-            !done_set.contains(name) && !failed_set.contains(name)
-        })
-        .collect();
+    let failed_history_count = manifest.failed.len();
+    let remaining = pending_replay_paths(replay_files, &done_set);
 
     println!(
-        "Found {} replays total. {} already processed, {} failed, {} remaining.",
+        "Found {} replays total. {} already processed, {} failed history, {} remaining.",
         total_replays,
         done_set.len(),
-        failed_set.len(),
+        failed_history_count,
         remaining.len()
     );
     if let Some(selected) = selected_subset.as_ref() {
@@ -880,12 +883,6 @@ fn process_single(
 
     let resolved = map_cache
         .get_map_data(&song_hash, replay_difficulty.as_deref(), Some(&replay_mode))?
-        .or_else(|| {
-            map_cache
-                .get_map_data(&song_hash, None, Some("Standard"))
-                .ok()
-                .flatten()
-        })
         .ok_or_else(|| anyhow!("missing map/difficulty for {}", song_hash))?;
 
     let extracted = extract_features(&frames, &resolved.beatmap, resolved.bpm)?;
@@ -896,8 +893,8 @@ fn process_single(
     Ok((
         ReplayManifestMeta {
             song_hash: song_hash.to_ascii_uppercase(),
-            difficulty: replay_difficulty,
-            mode: replay_mode,
+            difficulty: resolved.beatmap.difficulty.clone(),
+            mode: resolved.beatmap.mode.clone(),
             bpm: resolved.bpm,
             njs: resolved.beatmap.njs,
             jump_offset: resolved.beatmap.offset,
@@ -943,6 +940,15 @@ fn finite_f32_option(value: f32) -> Option<f32> {
     }
 }
 
+fn apply_state_pose_contract(pose: &mut [f32; POSE_DIM]) {
+    for &(start, end) in &[(0_usize, 3_usize), (7, 10), (14, 17)] {
+        for value in pose[start..end].iter_mut() {
+            *value = value.clamp(-STATE_POSE_POSITION_ABS_LIMIT, STATE_POSE_POSITION_ABS_LIMIT);
+        }
+    }
+    normalize_pose_quaternions(pose);
+}
+
 fn convert_dataset_frames(frames: &[DatasetFrame]) -> Result<Vec<PoseFrame>> {
     let mut output = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -951,6 +957,7 @@ fn convert_dataset_frames(frames: &[DatasetFrame]) -> Result<Vec<PoseFrame>> {
         }
         let mut pose = [0.0_f32; POSE_DIM];
         pose.copy_from_slice(&frame.pose[..POSE_DIM]);
+        apply_state_pose_contract(&mut pose);
         output.push(PoseFrame {
             time: frame.time,
             pose,
@@ -1140,9 +1147,14 @@ fn build_note_feature_vector(
             );
             let safe_njs = note_jump_speed.max(1e-6);
             let safe_head_z = f64::from(head_z);
-            let time_seconds = (time_offset / bps.max(1e-6))
+            let mut time_seconds = (time_offset / bps.max(1e-6))
                 + ((f64::from(TRACK_Z_BASE) + safe_head_z) / safe_njs);
-            let contact_time_beats = time_seconds * bps;
+            let contact_time_beats = clamp_f64(
+                time_seconds * bps,
+                f64::from(NOTE_TIME_FEATURE_MIN_BEATS),
+                f64::from(NOTE_TIME_FEATURE_MAX_BEATS),
+            );
+            time_seconds = contact_time_beats / bps.max(1e-6);
             let z_distance = time_seconds * safe_njs;
             let (dx, dy) = encode_cut_direction(note.cut_direction);
             out[base] = contact_time_beats as f32;
@@ -1383,7 +1395,12 @@ fn normalize_quaternion_lenient(quat: &mut [f32; 4]) {
 
 fn normalize_pose_quaternions(pose: &mut [f32; POSE_DIM]) {
     for &(start, end) in &[(3_usize, 7_usize), (10, 14), (17, 21)] {
-        let mut quat = [pose[start], pose[start + 1], pose[start + 2], pose[start + 3]];
+        let mut quat = [
+            pose[start],
+            pose[start + 1],
+            pose[start + 2],
+            pose[start + 3],
+        ];
         normalize_quaternion_lenient(&mut quat);
         pose[start..end].copy_from_slice(&quat);
     }
@@ -1400,8 +1417,8 @@ fn simulator_executable_pose_target(
             -TARGET_ACTION_DELTA_CLAMP[idx],
             TARGET_ACTION_DELTA_CLAMP[idx],
         );
-        target_pose[idx] =
-            (current_pose[idx] + target_delta).clamp(-ACTION_ABS_COMPONENT_LIMIT, ACTION_ABS_COMPONENT_LIMIT);
+        target_pose[idx] = (current_pose[idx] + target_delta)
+            .clamp(-ACTION_ABS_COMPONENT_LIMIT, ACTION_ABS_COMPONENT_LIMIT);
     }
     normalize_pose_quaternions(&mut target_pose);
     target_pose
@@ -1437,7 +1454,6 @@ fn write_replay_shard_file(
     let temp_path = shard_path.with_extension(format!("safetensors.tmp.{}", std::process::id()));
 
     let x_half: Vec<f16> = features.iter().copied().map(f16::from_f32).collect();
-    let y_half: Vec<f16> = targets.iter().copied().map(f16::from_f32).collect();
     let x_view = TensorView::new(
         Dtype::F16,
         vec![sample_count, INPUT_DIM],
@@ -1445,9 +1461,9 @@ fn write_replay_shard_file(
     )
     .context("failed to construct safetensors view for features")?;
     let y_view = TensorView::new(
-        Dtype::F16,
+        Dtype::F32,
         vec![sample_count, POSE_DIM],
-        cast_slice(&y_half),
+        cast_slice(targets),
     )
     .context("failed to construct safetensors view for targets")?;
     let tensors = BTreeMap::from([("x".to_string(), x_view), ("y".to_string(), y_view)]);
@@ -1535,6 +1551,10 @@ fn manifest_semantic_schema() -> ManifestSemanticSchema {
         background_frame_stride: BACKGROUND_FRAME_STRIDE,
         target_pose_horizon_frames: TARGET_POSE_HORIZON_FRAMES,
         sim_note_time_range_beats: vec![SIM_NOTE_TIME_MIN_BEATS, SIM_NOTE_TIME_MAX_BEATS],
+        note_time_feature_range_beats: vec![
+            NOTE_TIME_FEATURE_MIN_BEATS,
+            NOTE_TIME_FEATURE_MAX_BEATS,
+        ],
         sim_obstacle_time_range_beats: vec![
             SIM_OBSTACLE_TIME_MIN_BEATS,
             SIM_OBSTACLE_TIME_MAX_BEATS,
@@ -1547,6 +1567,7 @@ fn manifest_semantic_schema() -> ManifestSemanticSchema {
         velocity_dim: VELOCITY_DIM,
         track_z_base: TRACK_Z_BASE,
         shard_storage_dtype: SHARD_STORAGE_DTYPE.to_string(),
+        feature_storage_dtype: FEATURE_STORAGE_DTYPE.to_string(),
         action_contract: ManifestActionContract {
             action_dim: POSE_DIM,
             action_representation: "absolute_tracked_pose_target".to_string(),
@@ -1561,7 +1582,7 @@ fn manifest_semantic_schema() -> ManifestSemanticSchema {
             target_generation: "current_pose + clamp((future_pose - current_pose) / target_pose_horizon_frames, -per_step_delta_clamp, per_step_delta_clamp)".to_string(),
             future_pose_horizon_frames: TARGET_POSE_HORIZON_FRAMES,
             normalizes_quaternions: true,
-            stored_dtype: SHARD_STORAGE_DTYPE.to_string(),
+            stored_dtype: TARGET_STORAGE_DTYPE.to_string(),
         },
         sentinel_contract: ManifestSentinelContract {
             missing_note: ManifestMissingNoteSentinel {
@@ -1764,6 +1785,18 @@ fn load_replay_paths(replay_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+fn pending_replay_paths(replay_files: Vec<PathBuf>, done_set: &HashSet<String>) -> Vec<PathBuf> {
+    replay_files
+        .into_iter()
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                return false;
+            };
+            !done_set.contains(name)
+        })
+        .collect()
 }
 
 fn load_selected_replay_subset(
@@ -2197,6 +2230,10 @@ fn select_difficulty_entry(
         return Some(found.clone());
     }
 
+    if !pref_diff.is_empty() {
+        return None;
+    }
+
     let mode_matches: Vec<_> = entries
         .iter()
         .filter(|entry| normalize_mode_name(&entry.mode) == pref_mode)
@@ -2433,5 +2470,152 @@ fn encode_cut_direction(cut_dir: i32) -> (f32, f32) {
         6 => (-0.7071, -0.7071),
         7 => (0.7071, -0.7071),
         _ => (0.0, 0.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use zip::write::SimpleFileOptions;
+
+    use crate::io::write_bsor_path;
+    use crate::model::{Bsor, Info, MAGIC_NUMBER};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cybernoodles_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_expertplus_only_map(maps_dir: &Path, map_hash: &str) -> Result<()> {
+        let zip_path = maps_dir.join(format!("{map_hash}.zip"));
+        let file = File::create(zip_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("Info.dat", options)?;
+        zip.write_all(
+            br#"{
+                "_version": "2.1.0",
+                "_songName": "Difficulty Contract Test",
+                "_beatsPerMinute": 120.0,
+                "_difficultyBeatmapSets": [{
+                    "_beatmapCharacteristicName": "Standard",
+                    "_difficultyBeatmaps": [{
+                        "_difficulty": "ExpertPlus",
+                        "_beatmapFilename": "ExpertPlusStandard.dat",
+                        "_noteJumpMovementSpeed": 18.0,
+                        "_noteJumpStartBeatOffset": 0.0
+                    }]
+                }]
+            }"#,
+        )?;
+        zip.start_file("ExpertPlusStandard.dat", options)?;
+        zip.write_all(br#"{"_version":"2.0.0","_notes":[],"_obstacles":[]}"#)?;
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn test_replay(song_hash: &str, difficulty: &str) -> Bsor {
+        Bsor {
+            magic_number: MAGIC_NUMBER,
+            file_version: 1,
+            info: Info {
+                version: "1.0.0".to_string(),
+                game_version: "1.0.0".to_string(),
+                timestamp: "0".to_string(),
+                player_id: "player".to_string(),
+                player_name: "Player".to_string(),
+                platform: "pc".to_string(),
+                tracking_system: "openvr".to_string(),
+                hmd: "hmd".to_string(),
+                controller: "controller".to_string(),
+                song_hash: song_hash.to_string(),
+                song_name: "Song".to_string(),
+                mapper: "Mapper".to_string(),
+                difficulty: difficulty.to_string(),
+                score: 0,
+                mode: "Standard".to_string(),
+                environment: "DefaultEnvironment".to_string(),
+                modifiers: String::new(),
+                jump_distance: 0.0,
+                left_handed: false,
+                height: 1.7,
+                start_time: 0.0,
+                fail_time: 0.0,
+                speed: 1.0,
+            },
+            frames: Vec::new(),
+            notes: Vec::new(),
+            walls: Vec::new(),
+            heights: Vec::new(),
+            pauses: Vec::new(),
+            controller_offsets: None,
+            user_data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_replay_difficulty_rejects_wrong_chart() -> Result<()> {
+        let root = unique_temp_dir("explicit_replay_difficulty");
+        let maps_dir = root.join("maps");
+        fs::create_dir_all(&maps_dir)?;
+        let replay_path = root.join("hard.bsor");
+        let map_hash = "DIFFICULTYCONTRACT";
+        write_expertplus_only_map(&maps_dir, map_hash)?;
+        write_bsor_path(&replay_path, &test_replay(map_hash, "Hard"))?;
+
+        let map_cache = MapCache::new(maps_dir);
+        let err = process_single(&replay_path, &map_cache).unwrap_err();
+
+        assert!(format!("{err:#}").contains("missing map/difficulty"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn no_explicit_difficulty_selects_hardest_standard_truthfully() -> Result<()> {
+        let root = unique_temp_dir("generic_difficulty");
+        let maps_dir = root.join("maps");
+        fs::create_dir_all(&maps_dir)?;
+        let map_hash = "GENERICCONTRACT";
+        write_expertplus_only_map(&maps_dir, map_hash)?;
+
+        let map_cache = MapCache::new(maps_dir);
+        let resolved = map_cache
+            .get_map_data(map_hash, None, Some("Standard"))?
+            .expect("generic Standard request should select hardest Standard chart");
+
+        assert_eq!(resolved.beatmap.mode, "Standard");
+        assert_eq!(resolved.beatmap.difficulty.as_deref(), Some("ExpertPlus"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_manifest_entries_remain_pending_for_retry() {
+        let replay_files = vec![
+            PathBuf::from("already_done.bsor"),
+            PathBuf::from("failed_until_map_downloaded.bsor"),
+        ];
+        let done_set = HashSet::from(["already_done.bsor".to_string()]);
+
+        let pending = pending_replay_paths(replay_files, &done_set);
+
+        assert_eq!(
+            pending,
+            vec![PathBuf::from("failed_until_map_downloaded.bsor")]
+        );
     }
 }
