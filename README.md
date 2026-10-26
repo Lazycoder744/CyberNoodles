@@ -1,2 +1,2 @@
 # CyberNoodles
-An attempt to rival CyberRamen using VQ-VAE 2 (MotionGPT)
+Making an small Open-source model that can play Beat Saber!
