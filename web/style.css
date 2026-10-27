@@ -84,7 +84,6 @@ header h1 .noodle {
   color: var(--faint);
   font-size: 13px;
   line-height: 1.65;
-  overflow-wrap: anywhere;
 }
 
 .hint code { color: var(--dim); }
@@ -117,10 +116,14 @@ header h1 .noodle {
   min-width: 0;
 }
 
-/* The map-ID field only needs a short input; give the difficulty select the
- * remaining width so its label is not truncated on desktop. */
-.controls .pair:first-child { flex: 0 1 300px; }
-.controls .pair:last-child { flex: 1 1 360px; }
+.modelpair { flex-basis: 100%; }
+
+.modelpath {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
 
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .field.grow { flex: 1 1 auto; }
@@ -212,6 +215,17 @@ select { cursor: pointer; }
   color: var(--dim);
   overflow-wrap: anywhere;
 }
+
+.statusrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.statusrow .status { margin: 0; flex: 1 1 auto; }
+
+.btn.small { height: 32px; padding: 0 14px; font-size: 13px; flex: none; }
 
 .status.ok { color: var(--ok); }
 .status.warn { color: var(--warn); }
@@ -318,7 +332,6 @@ footer {
 }
 
 footer .hint { margin: 0; }
-footer .hint code { white-space: nowrap; }
 
 /* ---- small screens ---- */
 

@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#14110f">
-<title>CyberNoodles: A Beat Saber AI</title>
+<title>CyberNoodles — Beat Saber AI replays in your browser</title>
+<script src="coi-serviceworker.js"></script>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍜</text></svg>">
 </head>
@@ -14,12 +15,20 @@
   <header>
     <h1><span class="noodle" aria-hidden="true">🍜</span>CyberNoodles</h1>
     <p class="tag">
-      A cool AI that plays Beat Saber! Paste a BeatSaver ID below. This is fully local, so I hope you have a decent GPU. The result is a
-      <code>.bsor</code> file, a replay you can watch in ArcViewer or send to BeatLeader.
+      An AI that plays Beat Saber. Paste a BeatSaver ID, pick a Standard difficulty, and the
+      policy network runs right here in your browser. Nothing is uploaded, and the result is a
+      real <code>.bsor</code> replay you can watch in ArcViewer or send to BeatLeader.
     </p>
   </header>
 
   <section class="panel controls" aria-label="Generate a replay">
+    <div class="pair modelpair" id="model-row">
+      <div class="field grow">
+        <label for="load-model">Model</label>
+        <p class="modelpath mono" id="model-path">…</p>
+      </div>
+      <button id="load-model" class="btn primary">Download model</button>
+    </div>
     <div class="pair">
       <div class="field grow">
         <label for="bsr">BeatSaver map ID</label>
@@ -37,7 +46,10 @@
   </section>
 
   <div id="bar" class="bar" hidden><div id="bar-fill"></div></div>
-  <p id="status" class="status">Starting…</p>
+  <div class="statusrow">
+    <p id="status" class="status">Load the model to begin.</p>
+    <button id="cancel" class="btn small" hidden>Cancel</button>
+  </div>
 
   <section id="result" class="result" hidden></section>
 
@@ -46,16 +58,6 @@
     <div id="log" class="log"></div>
     <p class="model-line">Model: <span id="model-state" class="mono">…</span></p>
   </section>
-
-  <footer>
-    <p class="hint">
-      Everything runs locally. The map comes from BeatSaver and the model from this site
-      (or the URL you passed as <code class="mono">?model=</code>).
-      WebGPU is the intended and RECOMMENDED backend. The WASM fallback is much slower and can slightly change
-      scores. Replays are attributed to
-      <span class="mono">CyberNoodles [BOT]</span> but are not uploaded anywhere (work in progress!).
-    </p>
-  </footer>
 </main>
 <script src="lib/util.js"></script>
 <script src="lib/config.js"></script>

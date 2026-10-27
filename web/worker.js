@@ -15,6 +15,9 @@
  *   -> {type:'progress', phase, done, total, detail}
  *   -> {type:'result', bsor:ArrayBuffer, accuracy, frames, events, meta}
  *
+ *   <- {type:'cancel'}                                 abort the job in flight
+ *   -> {type:'cancelled'}                              (echoes the job's id)
+ *
  * Nothing here talks to a server beyond BeatSaver (CORS `*`) and whatever host
  * you point config.modelUrl at.
  */
@@ -24,18 +27,57 @@
 
 const CN = (self.CN = self.CN || {});
 
+let CANCELLED = false;   // set by a 'cancel' message; cleared when the job settles
+let IN_FLIGHT = false;   // one job at a time (the page serializes them)
+
 self.onmessage = (ev) => {
   const msg = ev.data || {};
   const job = { id: msg.id };
   const post = (m) => self.postMessage(Object.assign({ id: job.id }, m));
 
-  if (msg.type === 'init') {
-    handleInit(msg, post).catch((e) => post({ type: 'error', message: String(e && e.message || e) }));
-  } else if (msg.type === 'lookup') {
-    handleLookup(msg, post).catch((e) => post({ type: 'error', message: String(e && e.message || e) }));
-  } else if (msg.type === 'run') {
-    handleRun(msg, post).catch((e) => post({ type: 'error', message: String(e && e.message || e), stack: e && e.stack }));
+  if (msg.type === 'cancel') {
+    CANCELLED = true;
+    // The next batch run rejects, so a rollout stops at its next await. If
+    // nothing is running, confirm straight away — otherwise the page would
+    // wait for a reply that would never come.
+    if (!IN_FLIGHT) {
+      CANCELLED = false;
+      post({ type: 'cancelled' });
+    }
+    return;
   }
+
+  IN_FLIGHT = true;
+  let p;
+  if (msg.type === 'init') {
+    p = handleInit(msg, post);
+  } else if (msg.type === 'lookup') {
+    p = handleLookup(msg, post);
+  } else if (msg.type === 'run') {
+    p = handleRun(msg, post);
+  } else {
+    IN_FLIGHT = false;
+    return;
+  }
+
+  p.then(
+    () => {
+      IN_FLIGHT = false;
+      CANCELLED = false;
+    },
+    (e) => {
+      const cancelled = CANCELLED;
+      IN_FLIGHT = false;
+      CANCELLED = false;
+      if (cancelled) {
+        post({ type: 'cancelled' });
+      } else if (msg.type === 'run') {
+        post({ type: 'error', message: String(e && e.message || e), stack: e && e.stack });
+      } else {
+        post({ type: 'error', message: String(e && e.message || e) });
+      }
+    },
+  );
 };
 
 function loadScripts() {
@@ -75,6 +117,16 @@ async function handleInit(msg, post) {
   post({ type: 'progress', phase: 'create-session', done: 0, total: 0, detail: `${(bytes.length / 1048576).toFixed(1)} MiB` });
   SESSION = await CN.model.createSession(self.ort, bytes,
     (line) => post({ type: 'progress', phase: 'create-session', done: 0, total: 0, detail: line }));
+
+  // Cancellation hook: make the next batch reject so a cancelled rollout
+  // stops at its next await instead of grinding through every remaining
+  // window.  This wraps the session facade only — the runtime, its inputs
+  // and its outputs are untouched.
+  const rawRun = SESSION.run;
+  SESSION.run = (feeds) => (CANCELLED
+    ? Promise.reject(new Error('cancelled'))
+    : rawRun.call(SESSION, feeds));
+
   INPUTS = SESSION.inputNames;
   OUTPUTS = SESSION.outputNames;
   post({
@@ -164,6 +216,10 @@ async function handleRun(msg, post) {
     onProgress: (line) => post({ type: 'progress', phase: 'rollout', done: 0, total: 0, detail: line }),
   });
   if (!traj.length) throw new Error('rollout produced no frames');
+  if (CANCELLED) {
+    post({ type: 'cancelled' });
+    return;
+  }
 
   post({ type: 'progress', phase: 'scoring', done: 0, total: 0, detail: 'reconstructing cuts' });
   const det = CN.score.reconstruct(traj, md);
@@ -197,6 +253,10 @@ async function handleRun(msg, post) {
   const out = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
     ? bytes.buffer
     : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  if (CANCELLED) {
+    post({ type: 'cancelled' });
+    return;
+  }
 
   self.postMessage({
     id: msg.id,

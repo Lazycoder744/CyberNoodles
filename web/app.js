@@ -21,6 +21,10 @@ const ui = {
   modelState: el('model-state'),
   bar: el('bar'),
   barFill: el('bar-fill'),
+  modelRow: el('model-row'),
+  modelPath: el('model-path'),
+  loadModel: el('load-model'),
+  cancel: el('cancel'),
 };
 
 let worker = null;
@@ -30,6 +34,23 @@ let nextId = 1;
 let lastLookup = null;
 let lastResult = null;
 let lastUrl = null;
+
+let bootModelUrl = null;
+let bootEp = '';
+let running = false;   // a generation is in flight (cancel visible, unload guarded)
+
+function beforeUnload(e) {
+  e.preventDefault();
+  e.returnValue = '';
+}
+
+function guardUnload(on) {
+  // While inference runs, confirm before the tab closes. Tearing a WebGPU
+  // worker down mid-inference can crash Chrome's GPU process, so an
+  // accidental close is worth one confirmation dialog.
+  if (on) window.addEventListener('beforeunload', beforeUnload);
+  else window.removeEventListener('beforeunload', beforeUnload);
+}
 
 function log(line, cls) {
   const div = document.createElement('div');
@@ -54,11 +75,21 @@ function call(type, payload) {
 
 function onMessage(ev) {
   const m = ev.data || {};
-  const p = pending.get(m.id);
   if (m.type === 'progress') {
     renderProgress(m);
     return;
   }
+  if (m.type === 'cancelled') {
+    // The worker rejected the in-flight job; surface it through the same
+    // promise so run()/loadModel() can reset the UI in one place.
+    const p = pending.get(m.id);
+    if (p) {
+      pending.delete(m.id);
+      p.reject(new Error('cancelled'));
+    }
+    return;
+  }
+  const p = pending.get(m.id);
   if (!p) return;
   if (m.type === 'error') {
     pending.delete(m.id);
@@ -99,16 +130,16 @@ function endProgress() {
   ui.barFill.style.width = '0%';
 }
 
-async function boot() {
+function boot() {
   const params = new URLSearchParams(location.search);
-  const modelUrl = params.get('model');
-  if (modelUrl) CN.config.modelUrl = modelUrl;
+  bootModelUrl = params.get('model');
+  if (bootModelUrl) CN.config.modelUrl = bootModelUrl;
   let ep = (params.get('ep') || '').toLowerCase();
   if (ep && ['auto', 'webgpu', 'wasm'].indexOf(ep) < 0) {
     log(`ignoring ?ep=${ep} (expected auto, webgpu or wasm)`, 'hint');
     ep = '';
   }
-  if (ep) CN.config.executionProvider = ep;
+  bootEp = ep;
 
   if (!window.Worker) {
     setStatus('This browser has no Web Worker support.', 'bad');
@@ -122,14 +153,29 @@ async function boot() {
     setStatus('Worker crashed: ' + (e.message || 'unknown'), 'bad');
   };
 
-  ui.modelState.textContent = CN.config.modelUrl;
-  setStatus('Loading the model…');
-  log(`model: ${CN.config.modelUrl}`);
-  log(`onnxruntime-web ${CN.config.ortVersion} from ${CN.config.ortBase}`);
-  log(`execution provider: ${ep || 'auto (WebGPU if available)'}`);
+  // Best-effort teardown on leave: the worker aborts at the next batch and
+  // releases the inference session instead of dying with work in flight.
+  // Harmless when it loses the race with a hard tab close.
+  window.addEventListener('pagehide', () => {
+    if (worker) { try { worker.postMessage({ type: 'cancel' }); } catch {} }
+  });
 
+  // Nothing is fetched until the user asks for it — the model is ~91 MiB.
+  ui.modelPath.textContent = CN.config.modelUrl;
+  ui.loadModel.textContent = bootModelUrl ? 'Download model' : 'Download model (≈91 MiB)';
+  setStatus('Load the model to begin.');
+  log(`model: ${CN.config.modelUrl} (download starts on your click)`);
+  log(`onnxruntime-web ${CN.config.ortVersion} from ${CN.config.ortBase}`);
+  log(`execution provider: ${bootEp || 'auto (WebGPU if available)'}`);
+}
+
+async function loadModel() {
+  if (!worker) return;
+  ui.loadModel.disabled = true;
+  ui.loadModel.textContent = 'Loading…';
+  setStatus('Loading the model…');
   try {
-    const r = await call('init', { modelUrl: modelUrl || null, ep: ep || null });
+    const r = await call('init', { modelUrl: bootModelUrl || null, ep: bootEp || null });
     ready = true;
     endProgress();
     const webgpu = r.ep === 'webgpu';
@@ -145,14 +191,22 @@ async function boot() {
         + 'float32 drift can slightly change the score. Use a WebGPU-capable browser '
         + 'for the intended result.', 'hint');
     }
+    ui.modelRow.hidden = true;
     ui.lookup.disabled = false;
     ui.bsr.focus();
   } catch (e) {
     endProgress();
-    setStatus('Could not load the model: ' + e.message, 'bad');
-    log('model load failed: ' + e.message, 'bad');
-    log('If the file is not in web/models/, add ?model=<url> to the page URL '
-      + '(a CORS-enabled host such as a Hugging Face resolve/main link works).', 'hint');
+    if (e.message === 'cancelled') {
+      setStatus('Model load cancelled.', 'warn');
+      log('model load cancelled', 'hint');
+    } else {
+      setStatus('Could not load the model: ' + e.message, 'bad');
+      log('model load failed: ' + e.message, 'bad');
+      log('If the file is not in web/models/, add ?model=<url> to the page URL '
+        + '(a CORS-enabled host such as a Hugging Face resolve/main link works).', 'hint');
+    }
+    ui.loadModel.disabled = false;
+    ui.loadModel.textContent = 'Retry download';
   }
 }
 
@@ -175,8 +229,7 @@ async function lookup() {
       if (d.length) bits.push(`${Math.floor(d.length / 60)}:${String(Math.round(d.length % 60)).padStart(2, '0')}`);
       if (d.njs) bits.push(`NJS ${d.njs}`);
       if (d.nps) bits.push(`${d.nps.toFixed(1)} nps`);
-      o.textContent = `${d.difficulty} · ${d.notes}`;
-      o.title = `${d.difficulty} · ${bits.join(' · ')}`;
+      o.textContent = `${d.difficulty} · ${bits.join(' · ')}`;
       ui.diff.appendChild(o);
     }
     const prefer = ['ExpertPlus', 'Expert', 'Hard', 'Normal', 'Easy'];
@@ -201,6 +254,10 @@ async function run() {
   ui.run.disabled = true;
   ui.lookup.disabled = true;
   ui.result.hidden = true;
+  ui.cancel.hidden = false;
+  ui.cancel.disabled = false;
+  running = true;
+  guardUnload(true);
   const difficulty = ui.diff.value;
   try {
     log(`generating ${difficulty} replay…`);
@@ -214,13 +271,28 @@ async function run() {
     lastResult = r;
     renderResult(r);
   } catch (e) {
-    setStatus('Generation failed: ' + e.message, 'bad');
-    log('generation failed: ' + e.message, 'bad');
+    if (e.message === 'cancelled') {
+      setStatus('Cancelled — the session stays loaded, generate again any time.', 'warn');
+      log('generation cancelled', 'hint');
+    } else {
+      setStatus('Generation failed: ' + e.message, 'bad');
+      log('generation failed: ' + e.message, 'bad');
+    }
   } finally {
+    running = false;
+    guardUnload(false);
     endProgress();
+    ui.cancel.hidden = true;
     ui.run.disabled = false;
     ui.lookup.disabled = false;
   }
+}
+
+function cancelRun() {
+  if (!running || !worker) return;
+  ui.cancel.disabled = true;
+  setStatus('Cancelling…');
+  try { worker.postMessage({ type: 'cancel' }); } catch {}
 }
 
 function safeName(s) {
@@ -266,7 +338,7 @@ function renderResult(r) {
     ['Song', `${m.songName} · ${m.mapper}`],
     ['Difficulty', `${m.difficulty} · ${m.notes} notes · NJS ${m.njs}`],
     ['Map', `${m.bsr} (${m.hash.slice(0, 8)})`],
-    ['Replay', `${r.frames} frames @ ${m.fps} fps · ${r.events} events · ${(m.bytes / 1048576).toFixed(2)} MiB`],
+    ['Replay', `${r.frames} frames @ ${m.fps} fps · ${r.events} events · ${(r.bytes / 1048576).toFixed(2)} MiB`],
   ];
   for (const [k, v] of rows) {
     const dt = document.createElement('dt'); dt.textContent = k;
@@ -318,7 +390,7 @@ function renderResult(r) {
 
   ui.result.hidden = false;
   setStatus('Done.', 'ok');
-  log(`score ${acc.pct.toFixed(4)}% (${acc.score}/${acc.max}); wrote ${(m.bytes / 1048576).toFixed(2)} MiB`);
+  log(`score ${acc.pct.toFixed(4)}% (${acc.score}/${acc.max}); wrote ${(r.bytes / 1048576).toFixed(2)} MiB`);
 }
 
 function main() {
@@ -327,6 +399,8 @@ function main() {
   ui.diff.disabled = true;
   ui.lookup.addEventListener('click', lookup);
   ui.run.addEventListener('click', run);
+  ui.loadModel.addEventListener('click', loadModel);
+  ui.cancel.addEventListener('click', cancelRun);
   ui.bsr.addEventListener('keydown', (e) => { if (e.key === 'Enter') lookup(); });
   boot();
 }
