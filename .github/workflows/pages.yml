@@ -1,0 +1,66 @@
+# Publish the client-side app in web/ to GitHub Pages.
+#
+# Everything the app needs at runtime is static: index.html, style.css, app.js,
+# worker.js, lib/*.js and the ONNX model under web/models/. onnxruntime-web is
+# loaded from a pinned jsDelivr build, so no bundler or server is involved.
+#
+# The workflow stages the runtime files into _site, dropping the local web_v2/
+# reference copy, test/ and files.zip, then uploads that directory as the Pages
+# artifact on every push that touches web/ or this workflow.
+name: pages
+
+on:
+  push:
+    branches: [main, master]
+    paths: ['web/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sanity-check the pipeline before publishing.  The parity harness needs
+      # only Node and the reference data generator's output, so run the parts
+      # that do not need Python here (syntax check + unit-ish smoke test).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax check
+        run: |
+          for f in web/app.js web/worker.js web/lib/*.js web/test/*.mjs; do
+            node --check "$f"
+          done
+
+      # Upload only the runtime site.  web/web_v2 is a local reference copy
+      # with a second 91 MiB model, and web/test is not needed in the artifact.
+      - name: Stage site
+        run: |
+          mkdir -p _site
+          cp -r web/. _site/
+          rm -rf _site/web_v2 _site/test _site/files.zip
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

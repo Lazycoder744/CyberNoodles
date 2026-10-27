@@ -1,0 +1,15 @@
+/logs
+/__pycache__
+*.onnx
+*.zip
+model_save_*
+.bsor
+maps
+replays
+processed-replays
+tf-cache
+# browser app: web/models/ is ignored, but the shipped model is tracked via git add -f
+web/models/
+web/vendor/
+# local reference copy of the redesign (the live app is web/ itself)
+web/web_v2/

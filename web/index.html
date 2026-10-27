@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#14110f">
+<title>CyberNoodles — Beat Saber AI replays in your browser</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍜</text></svg>">
+</head>
+<body>
+<main>
+  <header>
+    <h1><span class="noodle" aria-hidden="true">🍜</span>CyberNoodles</h1>
+    <p class="tag">
+      A cool AI that plays Beat Saber! Paste a BeatSaver ID below. This is fully local, so I hope you have a decent GPU. The result is a
+      <code>.bsor</code> file, a replay you can watch in ArcViewer or send to BeatLeader.
+    </p>
+  </header>
+
+  <section class="panel controls" aria-label="Generate a replay">
+    <div class="pair">
+      <div class="field grow">
+        <label for="bsr">BeatSaver map ID</label>
+        <input id="bsr" type="text" placeholder="e.g. 1a8d4" autocomplete="off" spellcheck="false">
+      </div>
+      <button id="lookup" class="btn">Look up</button>
+    </div>
+    <div class="pair">
+      <div class="field grow">
+        <label for="diff">Difficulty</label>
+        <select id="diff"></select>
+      </div>
+      <button id="run" class="btn primary">Generate replay</button>
+    </div>
+  </section>
+
+  <div id="bar" class="bar" hidden><div id="bar-fill"></div></div>
+  <p id="status" class="status">Starting…</p>
+
+  <section id="result" class="result" hidden></section>
+
+  <section class="logpanel">
+    <h2>Log</h2>
+    <div id="log" class="log"></div>
+    <p class="model-line">Model: <span id="model-state" class="mono">…</span></p>
+  </section>
+
+  <footer>
+    <p class="hint">
+      Everything runs locally. The map comes from BeatSaver and the model from this site
+      (or the URL you passed as <code class="mono">?model=</code>).
+      WebGPU is the intended and RECOMMENDED backend. The WASM fallback is much slower and can slightly change
+      scores. Replays are attributed to
+      <span class="mono">CyberNoodles [BOT]</span> but are not uploaded anywhere (work in progress!).
+    </p>
+  </footer>
+</main>
+<script src="lib/util.js"></script>
+<script src="lib/config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
