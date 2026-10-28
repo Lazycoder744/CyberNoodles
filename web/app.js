@@ -25,6 +25,9 @@ const ui = {
   modelPath: el('model-path'),
   loadModel: el('load-model'),
   cancel: el('cancel'),
+  precision: el('precision'),
+  temp: el('temp'),
+  tempVal: el('temp-val'),
 };
 
 let worker = null;
@@ -37,6 +40,7 @@ let lastUrl = null;
 
 let bootModelUrl = null;
 let bootEp = '';
+let precision = 'fp32';   // 'fp16' | 'fp32', the dropdown at the top
 let running = false;   // a generation is in flight (cancel visible, unload guarded)
 
 function beforeUnload(e) {
@@ -50,6 +54,55 @@ function guardUnload(on) {
   // accidental close is worth one confirmation dialog.
   if (on) window.addEventListener('beforeunload', beforeUnload);
   else window.removeEventListener('beforeunload', beforeUnload);
+}
+
+const MODEL_SIZE = { fp16: '≈67 MiB', fp32: '≈134 MiB' };
+
+// ---- v2 style temperature ------------------------------------------------
+// z is a 16-d latent learned from human replay history (a beta-VAE style
+// latent).  temp=0 is the deterministic policy; temp>0 samples one coherent
+// style for the whole replay, so the same map produces different but
+// human-plausible runs.  The knob is inert on models without a style latent.
+function savedTemp() {
+  try {
+    const v = parseFloat(localStorage.getItem('cn.temp'));
+    return Number.isFinite(v) ? Math.max(0, Math.min(2, v)) : 0;
+  } catch { return 0; }
+}
+
+function saveTemp(v) {
+  try { localStorage.setItem('cn.temp', String(v)); } catch { /* storage unavailable */ }
+}
+
+function applyTemp() {
+  const v = parseFloat(ui.temp.value) || 0;
+  if (ui.tempVal) ui.tempVal.textContent = v.toFixed(1);
+  saveTemp(v);
+}
+
+function savedPrecision() {
+  try {
+    const v = localStorage.getItem('cn.precision');
+    return v === 'fp16' || v === 'fp32' ? v : null;
+  } catch { return null; }
+}
+
+function savePrecision(v) {
+  try { localStorage.setItem('cn.precision', v); } catch { /* storage unavailable */ }
+}
+
+// The dropdown stays locked while a model loads or a replay runs, and when
+// ?model= points the page at a custom file.
+function setPrecisionEnabled(on) {
+  ui.precision.disabled = bootModelUrl ? true : !on;
+}
+
+function applyPrecision() {
+  if (!bootModelUrl) CN.config.modelUrl = CN.config.modelUrls[precision];
+  ui.modelPath.textContent = Array.isArray(CN.config.modelUrl)
+    ? CN.config.modelUrl.join(' + ')
+    : CN.config.modelUrl;
+  ui.loadModel.textContent = bootModelUrl ? 'Download model' : `Download model (${MODEL_SIZE[precision]})`;
 }
 
 function log(line, cls) {
@@ -77,6 +130,10 @@ function onMessage(ev) {
   const m = ev.data || {};
   if (m.type === 'progress') {
     renderProgress(m);
+    return;
+  }
+  if (m.type === 'log') {
+    log(m.line, m.cls);
     return;
   }
   if (m.type === 'cancelled') {
@@ -133,7 +190,11 @@ function endProgress() {
 function boot() {
   const params = new URLSearchParams(location.search);
   bootModelUrl = params.get('model');
+  const forced = (params.get('precision') || '').toLowerCase();
+  precision = (forced === 'fp16' || forced === 'fp32') ? forced : (savedPrecision() || 'fp32');
   if (bootModelUrl) CN.config.modelUrl = bootModelUrl;
+  ui.precision.value = precision;
+  setPrecisionEnabled(true);
   let ep = (params.get('ep') || '').toLowerCase();
   if (ep && ['auto', 'webgpu', 'wasm'].indexOf(ep) < 0) {
     log(`ignoring ?ep=${ep} (expected auto, webgpu or wasm)`, 'hint');
@@ -154,17 +215,20 @@ function boot() {
   };
 
   // Best-effort teardown on leave: the worker aborts at the next batch and
-  // releases the inference session instead of dying with work in flight.
-  // Harmless when it loses the race with a hard tab close.
-  window.addEventListener('pagehide', () => {
-    if (worker) { try { worker.postMessage({ type: 'cancel' }); } catch {} }
+  // releases the GPU session instead of dying with work in flight. Harmless
+  // when it loses the race with a hard tab close. A page that goes into the
+  // back/forward cache (persisted) is coming back, so it keeps its session.
+  window.addEventListener('pagehide', (e) => {
+    if (e.persisted || !worker) return;
+    try { worker.postMessage({ type: 'dispose' }); } catch {}
   });
 
-  // Nothing is fetched until the user asks for it — the model is ~91 MiB.
-  ui.modelPath.textContent = CN.config.modelUrl;
-  ui.loadModel.textContent = bootModelUrl ? 'Download model' : 'Download model (≈91 MiB)';
+  // Nothing is fetched until the user asks for it.
+  ui.temp.value = String(savedTemp());
+  applyTemp();
+  applyPrecision();
   setStatus('Load the model to begin.');
-  log(`model: ${CN.config.modelUrl} (download starts on your click)`);
+  log(`model: ${CN.config.modelUrl} (${precision.toUpperCase()}; download starts on your click)`);
   log(`onnxruntime-web ${CN.config.ortVersion} from ${CN.config.ortBase}`);
   log(`execution provider: ${bootEp || 'auto (WebGPU if available)'}`);
 }
@@ -173,9 +237,12 @@ async function loadModel() {
   if (!worker) return;
   ui.loadModel.disabled = true;
   ui.loadModel.textContent = 'Loading…';
+  setPrecisionEnabled(false);
   setStatus('Loading the model…');
   try {
-    const r = await call('init', { modelUrl: bootModelUrl || null, ep: bootEp || null });
+    const r = await call('init', {
+      modelUrl: CN.config.modelUrl, fp16: precision === 'fp16', ep: bootEp || null,
+    });
     ready = true;
     endProgress();
     const webgpu = r.ep === 'webgpu';
@@ -184,7 +251,7 @@ async function loadModel() {
       : `WASM, ${r.threads} thread${r.threads === 1 ? '' : 's'}`;
     ui.modelState.textContent = `${CN.config.modelUrl} · ${backend}`;
     setStatus(`Model ready (${backend}${webgpu ? '' : ', legacy fallback'}). Enter a BeatSaver ID.`, webgpu ? 'ok' : 'warn');
-    log(`model loaded: ${(r.modelBytes / 1048576).toFixed(1)} MiB; inputs [${r.inputs.join(', ')}]`);
+    log(`model loaded (${precision.toUpperCase()}): ${(r.modelBytes / 1048576).toFixed(1)} MiB; inputs [${r.inputs.join(', ')}]`);
     log(`backend: ${backend}`);
     if (!webgpu) {
       log('Legacy WASM fallback: inference is roughly 30× slower, and last-bit '
@@ -193,6 +260,8 @@ async function loadModel() {
     }
     ui.modelRow.hidden = true;
     ui.lookup.disabled = false;
+    ui.run.disabled = !lastLookup;
+    setPrecisionEnabled(true);
     ui.bsr.focus();
   } catch (e) {
     endProgress();
@@ -202,12 +271,38 @@ async function loadModel() {
     } else {
       setStatus('Could not load the model: ' + e.message, 'bad');
       log('model load failed: ' + e.message, 'bad');
-      log('If the file is not in web/models/, add ?model=<url> to the page URL '
-        + '(a CORS-enabled host such as a Hugging Face resolve/main link works).', 'hint');
+      if (/fetch/i.test(e.message)) {
+        log('If the file is not in web/models/, add ?model=<url> to the page URL '
+          + '(a CORS-enabled host such as a Hugging Face resolve/main link works).', 'hint');
+      }
     }
+    setPrecisionEnabled(true);
     ui.loadModel.disabled = false;
     ui.loadModel.textContent = 'Retry download';
   }
+}
+
+async function switchPrecision() {
+  const next = ui.precision.value;
+  if (next === precision) return;
+  if (running) { ui.precision.value = precision; return; }
+  precision = next;
+  savePrecision(next);
+  if (ready) {
+    // Different weights: let go of the loaded session, then offer the new download.
+    setPrecisionEnabled(false);
+    ui.lookup.disabled = true;
+    ui.run.disabled = true;
+    try { await call('unload'); } catch (e) { log('unload failed: ' + e.message, 'bad'); }
+    ready = false;
+    ui.modelState.textContent = '…';
+    ui.modelRow.hidden = false;
+    setPrecisionEnabled(true);
+  }
+  applyPrecision();
+  ui.loadModel.disabled = false;
+  setStatus('Load the model to begin.');
+  log(`switched to ${next.toUpperCase()}: ${CN.config.modelUrl}`);
 }
 
 async function lookup() {
@@ -257,16 +352,25 @@ async function run() {
   ui.cancel.hidden = false;
   ui.cancel.disabled = false;
   running = true;
+  setPrecisionEnabled(false);
   guardUnload(true);
   const difficulty = ui.diff.value;
   try {
     log(`generating ${difficulty} replay…`);
+    const temp = parseFloat(ui.temp.value) || 0;
+    // One style sample per run: a fresh seed gives a different (still
+    // human-trained) variation each time, and the seed is logged so a run can
+    // be reproduced with ?seed= on the next version of this page.
+    const seed = (Math.random() * 0x7fffffff) | 0;
+    if (temp > 0) log(`style temperature ${temp.toFixed(1)} (seed ${seed})`);
     const r = await call('run', {
       bsr: lastLookup.meta.bsr,
       hash: lastLookup.versions[0].hash,
       downloadURL: lastLookup.versions[0].downloadURL,
       apiJson: lastLookup.api,
       difficulty,
+      temp,
+      seed,
     });
     lastResult = r;
     renderResult(r);
@@ -280,6 +384,7 @@ async function run() {
     }
   } finally {
     running = false;
+    setPrecisionEnabled(true);
     guardUnload(false);
     endProgress();
     ui.cancel.hidden = true;
@@ -400,6 +505,8 @@ function main() {
   ui.lookup.addEventListener('click', lookup);
   ui.run.addEventListener('click', run);
   ui.loadModel.addEventListener('click', loadModel);
+  ui.precision.addEventListener('change', switchPrecision);
+  ui.temp.addEventListener('input', applyTemp);
   ui.cancel.addEventListener('click', cancelRun);
   ui.bsr.addEventListener('keydown', (e) => { if (e.key === 'Enter') lookup(); });
   boot();

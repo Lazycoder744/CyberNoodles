@@ -21,9 +21,26 @@
   const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
   CN.config = {
-    // fp32 ONNX exported by bsopencode/export_onnx.py (step 275000, the shipped
-    // checkpoint).  Same-origin by default:
-    modelUrl: 'models/cybernoodles_final_r5_275000.onnx',
+    // CyberNoodles v2 (12-block trunk + style latent), exported by
+    // bsopencode/export_onnx.py and export_onnx_fp16.py.  GitHub rejects any
+    // file over 100 MiB, and the fp32 model is ~134 MiB, so it ships as two
+    // same-origin parts that worker.js joins in memory.  Both URLs are
+    // same-origin by default.
+    modelUrl: [
+      'models/cybernoodles_v2_fp32_part0.onnx',
+      'models/cybernoodles_v2_fp32_part1.onnx',
+    ],
+
+    // The two modes behind the FP16 / FP32 dropdown.  FP16 is a native
+    // half-precision export (same weights, fp32 inputs/outputs) and runs on
+    // WebGPU only; it is roughly half the download.
+    modelUrls: {
+      fp16: 'models/cybernoodles_v2_fp16.onnx',
+      fp32: [
+        'models/cybernoodles_v2_fp32_part0.onnx',
+        'models/cybernoodles_v2_fp32_part1.onnx',
+      ],
+    },
 
     // onnxruntime-web
     ortVersion: ORT_VERSION,

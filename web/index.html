@@ -13,7 +13,13 @@
 <body>
 <main>
   <header>
-    <h1><span class="noodle" aria-hidden="true">🍜</span>CyberNoodles</h1>
+    <div class="top">
+      <h1><span class="noodle" aria-hidden="true">🍜</span>CyberNoodles</h1>
+      <select id="precision" class="precision" aria-label="Model precision">
+        <option value="fp16">FP16</option>
+        <option value="fp32">FP32</option>
+      </select>
+    </div>
     <p class="tag">
       An AI that plays Beat Saber. Paste a BeatSaver ID, pick a Standard difficulty, and the
       policy network runs right here in your browser. Nothing is uploaded, and the result is a
@@ -42,6 +48,13 @@
         <select id="diff"></select>
       </div>
       <button id="run" class="btn primary">Generate replay</button>
+    </div>
+    <div class="pair">
+      <div class="field grow">
+        <label for="temp">Style temperature <span id="temp-val" class="mono">0.0</span></label>
+        <input id="temp" type="range" min="0" max="2" step="0.1" value="0">
+        <p class="modelpath">0 = deterministic. Higher values sample a different (still human-trained) swing style per run.</p>
+      </div>
     </div>
   </section>
 

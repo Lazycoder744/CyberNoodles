@@ -101,7 +101,10 @@ const call = (msg) => new Promise((resolve) => {
 
 // ---------------------------------------------------------------------------
 console.log('--- init ---');
-const ready = await call({ type: 'init', modelUrl: `${ORIGIN}/models/cybernoodles_final_r5_275000.onnx` });
+const ready = await call({ type: 'init', modelUrl: [
+  `${ORIGIN}/models/cybernoodles_v2_fp32_part0.onnx`,
+  `${ORIGIN}/models/cybernoodles_v2_fp32_part1.onnx`,
+] });
 if (ready.type === 'error') { console.log('FAIL init: ' + ready.message); process.exit(1); }
 console.log(`ready: ${(ready.modelBytes / 1048576).toFixed(1)} MiB inputs=[${ready.inputs}]`);
 

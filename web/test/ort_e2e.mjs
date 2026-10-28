@@ -15,12 +15,12 @@
  *     node web/test/ort_e2e.mjs \
  *       --map maps_cache/b5a1424cad898181d429cb231b83296a3e67d58f \
  *       --diff ExpertPlus \
- *       --shipped replays/replays_final_r5_275000/DeathFromAbove.bsor
+ *       --shipped replays/41a23_v2b_step305000.bsor
  *
  * Options:
  *   --map <dir>        map directory (info.dat + difficulty files)   [required]
  *   --diff <name>      difficulty                                     [ExpertPlus]
- *   --model <file>     ONNX checkpoint  [replays/cybernoodles_final_r5_275000.onnx]
+ *   --model <file>     ONNX checkpoint  [replays/cybernoodles_v2b_best.onnx]
  *   --shipped <file>   .bsor to compare against (decoded, not byte-compared)
  *   --seconds <n>      clamp the rollout to n seconds   (default 30; 0 = full)
  *   --full             shorthand for --seconds 0
@@ -38,7 +38,7 @@ function arg(name, dflt) {
 
 const mapDir = arg('map', null);
 const diff = arg('diff', 'ExpertPlus');
-const modelPath = arg('model', path.join(REPO, 'replays/cybernoodles_final_r5_275000.onnx'));
+const modelPath = arg('model', path.join(REPO, 'replays/cybernoodles_v2b_best.onnx'));
 const shippedPath = arg('shipped', null);
 const seconds = process.argv.includes('--full') ? 0 : Number(arg('seconds', 30));
 const ortModule = process.env.ORT_MODULE

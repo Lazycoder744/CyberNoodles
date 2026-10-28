@@ -1,0 +1,22 @@
+{
+ "step": 305000,
+ "d": 384,
+ "hist": true,
+ "hist_frames": 100,
+ "latent_dim": 16,
+ "rot6d": true,
+ "opset": 17,
+ "fps": 90.0,
+ "inputs": [
+  "x1",
+  "x2",
+  "x3",
+  "hist",
+  "htime",
+  "hmask",
+  "z"
+ ],
+ "output": "pose",
+ "params": 33115161,
+ "precision": "fp16"
+}

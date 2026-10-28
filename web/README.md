@@ -5,7 +5,8 @@ CyberNoodles policy network **in your browser** and writes a real `.bsor`
 replay you can watch in ArcViewer or upload to BeatLeader.
 
 Nothing is uploaded, and there is no inference server: the map is fetched from
-BeatSaver, the model is fetched from wherever `CN.config.modelUrl` points, and
+BeatSaver, the model is fetched from wherever `CN.config.modelUrl` points (only
+when you click **Download model** — nothing is fetched on page load), and
 the rollout, cut reconstruction, scoring and BSOR writing all happen locally.
 
 ```
@@ -13,6 +14,7 @@ index.html      page shell + script tags
 app.js          UI, talks to the worker, renders progress/result
 worker.js       the whole pipeline (classic worker, importScripts)
 style.css       styling
+coi-serviceworker.js  COOP/COEP shim, enables threaded WASM on Pages
 lib/util.js     pyRound (round-half-even) and IEEE float32 helpers
 lib/config.js   model URL, onnxruntime-web version, rollout settings
 lib/zip.js      dependency-free ZIP reader (DecompressionStream)
@@ -48,6 +50,24 @@ slower and its float32 path can slightly change the score. `?ep=wasm` is meant
 for debugging and verification. WebNN is intentionally not offered — see
 Runtime notes for the measurement.
 
+## Model precision (FP16 / FP32)
+
+The dropdown in the top corner picks which model file the **Download model**
+button fetches. FP32 is the reference. FP16 is half the size and runs faster,
+but only on **WebGPU with `shader-f16`**: the WASM backend has no usable FP16
+kernels, so choosing FP16 without a capable GPU fails with a message instead of
+silently crawling (pick FP32 then). FP16 changes the maths slightly, so scores
+can differ a little from FP32; compare a couple of maps before trusting it.
+The choice is remembered in `localStorage`; `?model=<url>` locks the dropdown
+and `?precision=fp16` marks a custom file as FP16.
+
+The FP16 file is a **native** half-precision export of the same weights (fp32
+inputs and outputs, so the JS is unchanged), produced by
+`bsopencode/export_onnx_fp16.py`. Do not use `onnxconverter-common`: it leaves
+FP16/FP32 islands that ORT refuses to load. The exporter runs a parity check
+against the fp32 graph on real map windows; keep it under a couple of cm / a
+degree or the export drifted.
+
 ## Watching the replay
 
 The page writes the `.bsor` and offers it as a download. ArcViewer takes a
@@ -67,31 +87,53 @@ python3 bsopencode/serve_replays.py <folder with the .bsor> 8765   # CORS + Rang
 (ArcViewer) is allowed to fetch it — that is what makes the loopback trick work
 from a Pages deployment.
 
-## The model
+## Giving the page a model
 
-The shipped model is `web/models/cybernoodles_final_r5_275000.onnx` (≈91 MiB,
-step 275000), committed with the site so the default same-origin URL needs no
-CORS. `web/models/` and `*.onnx` are gitignored by the repository, so the file
-was force-added; if you replace it, stage the new file with `git add -f`. The
-cost is 91 MiB in every clone and every Pages deploy.
-
-To use a different model without changing the repository, open the page with:
+The shipped models are **v2** (step 305000, 12-block trunk + style latent):
+`cybernoodles_v2_fp16.onnx` (≈64 MiB) and the fp32 reference, which is
+split into two same-origin parts because a single file would be ≈128 MiB and
+GitHub rejects anything over 100 MiB:
 
 ```
-index.html?model=https://huggingface.co/<user>/<repo>/resolve/main/cybernoodles_final_r5_275000.onnx
+web/models/cybernoodles_v2_fp32_part0.onnx      ≈64 MiB   } worker.js joins
+web/models/cybernoodles_v2_fp32_part1.onnx      ≈64 MiB   } these in memory
+web/models/cybernoodles_v2_fp16.onnx            ≈64 MiB
+web/models/cybernoodles_v2_fp32_part0.onnx.json            sidecar (latent dim)
 ```
 
-A Hugging Face `resolve/main` link echoes the browser's origin and works, as
-does jsDelivr. GitHub *release assets* are not CORS-open — the final redirect to
-`release-assets.githubusercontent.com` carries no `access-control-allow-origin`,
-so a release URL will not work here.
+`CN.config.modelUrls` already points at these names, so you only have to put the
+files in place. Both are **same-origin by default**, so no CORS is involved. To
+publish them with the site, force-add them (`.gitignore` has `*.onnx`):
+
+```bash
+cp replays/cybernoodles_v2_fp16.onnx        web/models/
+python bsopencode/split_onnx.py --in replays/cybernoodles_v2b_best.onnx \
+    --parts 2 --outdir web/models --name cybernoodles_v2_fp32 --copy-json
+git add -f web/models/cybernoodles_v2_fp16.onnx \
+           web/models/cybernoodles_v2_fp16.onnx.json \
+           web/models/cybernoodles_v2_fp32_part0.onnx \
+           web/models/cybernoodles_v2_fp32_part0.onnx.json \
+           web/models/cybernoodles_v2_fp32_part1.onnx
+```
+
+Each file is under the 100 MiB limit, but the set still makes every clone and
+every Pages deploy carry ≈192 MiB.
+
+**Or point the page at a CORS-enabled URL.** A Hugging Face `resolve/main` link
+echoes the browser's origin and works; so does jsDelivr. Open the page with:
+
+```
+index.html?model=https://huggingface.co/<user>/<repo>/resolve/main/cybernoodles_v2_fp16.onnx
+```
+
+(Note: GitHub *release assets* are not CORS-open — the final redirect to
+`release-assets.githubusercontent.com` carries no
+`access-control-allow-origin`, so a release URL will not work here.)
 
 ## Publishing
 
-`.github/workflows/pages.yml` stages the runtime files from `web/` into
-`_site` (dropping the local `web_v2/` reference copy, `test/` and `files.zip`)
-and uploads that as the Pages artifact on every push that touches `web/` or the
-workflow.  In the repository settings set **Settings → Pages → Build and
+`.github/workflows/pages.yml` uploads `web/` as the Pages artifact on every push
+that touches it.  In the repository settings set **Settings → Pages → Build and
 deployment → Source: GitHub Actions** once; the branch-based option would only
 let you serve `/` or `/docs`.
 
@@ -108,15 +150,31 @@ let you serve `/` or `/docs`.
   in the page log, and WASM carries a warning: it is roughly 30× slower and can
   slightly change the score. On this dev machine the adapter is an RTX 4050 via
   Vulkan.
+* **WebGPU on Linux Chrome.** Whether `navigator.gpu` exists without
+  `--enable-unsafe-webgpu` is decided by Chrome, not the page. Per the WebGPU
+  implementation-status page, Linux ships by default only for Intel Gen12+ and for
+  NVIDIA (driver 535.183.01+) on Wayland; other GPUs still need the flag plus
+  Vulkan (`--enable-unsafe-webgpu --ozone-platform=x11 --use-angle=vulkan
+  --enable-features=Vulkan,VulkanFromANGLE`). The page logs why WebGPU was not
+  used, the adapter it found, and the real error if a session cannot be built,
+  and it ignores software (SwiftShader) adapters.
 * **WebNN is not used.** onnxruntime-web 1.22 ships a `webnn` EP, but it needs
   `navigator.ml`, which Chrome 155 on Linux does not expose even with
   `--enable-features=WebNN`; ORT logs `WebNN is not supported in current
   environment` and silently runs on WASM. Browsers that do expose WebNN also
   expose WebGPU, so it would add a third backend without changing the default.
+* **Cross-origin isolation without headers.** `coi-serviceworker.js`
+  (gzuidhof/coi-serviceworker, MIT) adds COOP/COEP on the fly, so GitHub Pages
+  deployments get `SharedArrayBuffer` and the WASM fallback runs on up to 8
+  threads instead of 1. The first visit reloads the page once while the
+  worker activates; on a host that already sends the headers the script does
+  nothing (delete it if you don't want it).
 * **WASM threading.** Threaded WASM needs `SharedArrayBuffer`, which browsers
   only expose to cross-origin-isolated pages (COOP+COEP). GitHub Pages cannot
-  send those headers, so visitors get `ort.env.wasm.numThreads = 1`; a
-  self-hosted copy that sets them gets `min(8, hardwareConcurrency)`.
+  send those headers, so the shipped `coi-serviceworker.js` adds them for it —
+  see the isolation note above. Without them (worker removed) visitors get
+  `ort.env.wasm.numThreads = 1`; a self-hosted copy that sets them gets
+  `min(8, hardwareConcurrency)`.
 * **Speed.** Two forward passes per 50-frame window, stride 25. Measured
   headlessly (batch 24, real encoded windows):
   - one batch: **125 ms WebGPU**, 1,382 ms WASM 8 threads, 4,128 ms WASM
@@ -135,6 +193,18 @@ let you serve `/` or `/docs`.
   changed. That is the same last-bit float32 drift, not a different trajectory —
   and the page always reports the score of the file it writes.
 * **Standard characteristic only** (no 360/90/lightshow difficulties).
+* **Cancel and tab close.** While a replay is generating, a Cancel button
+  aborts at the next inference batch — the session stays loaded and the page
+  stays usable. Closing or reloading the tab mid-run asks for confirmation:
+  tearing a WebGPU worker down mid-inference can take Chrome's GPU process
+  with it, so cancel instead of closing. A `pagehide` handler also asks the
+  worker to abort and release its GPU session (best effort) when you navigate
+  away. This reduces the chance of a crash; it cannot remove it, because the
+  crash is in Chrome's GPU process, not in the page.
+* **Consent-gated model download.** The model (≈64 MiB in FP16, ≈128 MiB in
+  FP32) is fetched only when you click **Download model**; the page load itself
+  fetches nothing but the app code. A failed download re-enables the button as
+  Retry download.
 
 ## Is the replay honest?
 
@@ -201,7 +271,7 @@ ORT_MODULE=$PWD/node_modules/onnxruntime-web/dist/ort.node.min.mjs \
   node web/test/ort_e2e.mjs \
     --map maps_cache/b5a1424cad898181d429cb231b83296a3e67d58f \
     --diff ExpertPlus \
-    --shipped replays/replays_final_r5_275000/DeathFromAbove.bsor \
+    --shipped replays/41a23_v2b_step305000.bsor \
     --full
 ```
 

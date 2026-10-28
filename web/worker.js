@@ -18,6 +18,11 @@
  *   <- {type:'cancel'}                                 abort the job in flight
  *   -> {type:'cancelled'}                              (echoes the job's id)
  *
+ *   <- {type:'unload'}                                 release the session (model switch)
+ *   -> {type:'unloaded'}
+ *   <- {type:'dispose'}                                page is closing: abort, then release
+ *   -> {type:'log', line, cls}                         diagnostics for the page log
+ *
  * Nothing here talks to a server beyond BeatSaver (CORS `*`) and whatever host
  * you point config.modelUrl at.
  */
@@ -27,8 +32,10 @@
 
 const CN = (self.CN = self.CN || {});
 
+let MODEL_LATENT = 0;    // style-latent width read from the .onnx.json sidecar
 let CANCELLED = false;   // set by a 'cancel' message; cleared when the job settles
 let IN_FLIGHT = false;   // one job at a time (the page serializes them)
+let DISPOSE = false;     // the page is closing: free the session once nothing is running
 
 self.onmessage = (ev) => {
   const msg = ev.data || {};
@@ -47,10 +54,21 @@ self.onmessage = (ev) => {
     return;
   }
 
+  if (msg.type === 'dispose') {
+    // The tab is going away. Stop at the next batch and hand the GPU session
+    // back cleanly instead of letting Chrome tear it down mid-inference.
+    DISPOSE = true;
+    if (IN_FLIGHT) CANCELLED = true;
+    else releaseSession();
+    return;
+  }
+
   IN_FLIGHT = true;
   let p;
   if (msg.type === 'init') {
     p = handleInit(msg, post);
+  } else if (msg.type === 'unload') {
+    p = handleUnload(msg, post);
   } else if (msg.type === 'lookup') {
     p = handleLookup(msg, post);
   } else if (msg.type === 'run') {
@@ -64,11 +82,13 @@ self.onmessage = (ev) => {
     () => {
       IN_FLIGHT = false;
       CANCELLED = false;
+      if (DISPOSE) releaseSession();
     },
     (e) => {
       const cancelled = CANCELLED;
       IN_FLIGHT = false;
       CANCELLED = false;
+      if (DISPOSE) releaseSession();
       if (cancelled) {
         post({ type: 'cancelled' });
       } else if (msg.type === 'run') {
@@ -93,30 +113,73 @@ function loadScripts() {
 }
 
 let SESSION = null;
+let SESSION_KEY = '';
 let MODEL_BYTES = 0;
 let INPUTS = null;
 let OUTPUTS = null;
 
+async function releaseSession() {
+  const s = SESSION;
+  SESSION = null;
+  SESSION_KEY = '';
+  INPUTS = null;
+  OUTPUTS = null;
+  MODEL_LATENT = 0;
+  if (s && s.raw && typeof s.raw.release === 'function') {
+    try { await s.raw.release(); } catch (e) { /* already gone */ }
+  }
+}
+
+async function handleUnload(msg, post) {
+  await releaseSession();
+  post({ type: 'unloaded' });
+}
+
 async function handleInit(msg, post) {
   loadScripts();
-  if (SESSION) {
+  const url = msg.modelUrl || CN.config.modelUrl;
+  const fp16 = !!msg.fp16;
+  const key = url + '|' + (fp16 ? 'fp16' : 'fp32');
+  if (SESSION && SESSION_KEY === key) {
     post({
       type: 'ready', modelBytes: MODEL_BYTES, inputs: INPUTS, outputs: OUTPUTS,
-      cached: true, ep: SESSION.ep, threads: SESSION.threads,
+      cached: true, ep: SESSION.ep, threads: SESSION.threads, fp16,
+      latent: MODEL_LATENT,
     });
     return;
   }
-  if (msg.modelUrl) CN.config.modelUrl = msg.modelUrl;
+  if (SESSION) await releaseSession();   // a different model was asked for
+  CN.config.modelUrl = url;
   if (msg.ep) CN.config.executionProvider = String(msg.ep).toLowerCase();
+  if (fp16) await CN.model.assertFp16Ready(CN.config.executionProvider);   // before the download
 
-  post({ type: 'progress', phase: 'fetch-model', done: 0, total: 0, detail: CN.config.modelUrl });
-  const bytes = await CN.model.fetchBytes(CN.config.modelUrl, (got, total) => {
-    post({ type: 'progress', phase: 'fetch-model', done: got, total });
+  const parts = Array.isArray(CN.config.modelUrl)
+    ? CN.config.modelUrl.length : 1;
+  post({ type: 'progress', phase: 'fetch-model', done: 0, total: 0,
+         detail: parts > 1 ? `${CN.config.modelUrl[0]} (+${parts - 1} part)` : CN.config.modelUrl });
+  const bytes = await CN.model.fetchBytes(CN.config.modelUrl, (got, total, info) => {
+    post({ type: 'progress', phase: 'fetch-model', done: got, total,
+           detail: info && info.parts > 1 ? `part ${info.part}/${info.parts}` : '' });
   });
+  // The sidecar describes the style latent (0 for v1 checkpoints).  Optional:
+  // an old model without it simply has no temperature knob.
+  MODEL_LATENT = 0;
+  try {
+    const metaUrl = (Array.isArray(CN.config.modelUrl)
+      ? CN.config.modelUrl[0] : CN.config.modelUrl) + '.json';
+    const mr = await fetch(metaUrl, { cache: 'no-store' });
+    if (mr.ok) {
+      const meta = await mr.json();
+      MODEL_LATENT = Number(meta && meta.latent_dim) || 0;
+    }
+  } catch (e) { /* no sidecar: fine */ }
   MODEL_BYTES = bytes.length;
   post({ type: 'progress', phase: 'create-session', done: 0, total: 0, detail: `${(bytes.length / 1048576).toFixed(1)} MiB` });
-  SESSION = await CN.model.createSession(self.ort, bytes,
-    (line) => post({ type: 'progress', phase: 'create-session', done: 0, total: 0, detail: line }));
+  const session = await CN.model.createSession(self.ort, bytes,
+    (line) => post({ type: 'progress', phase: 'create-session', done: 0, total: 0, detail: line }),
+    { fp16, log: (line, cls) => post({ type: 'log', line, cls }) });
+  SESSION = session;
+  SESSION_KEY = key;
 
   // Cancellation hook: make the next batch reject so a cancelled rollout
   // stops at its next await instead of grinding through every remaining
@@ -131,7 +194,7 @@ async function handleInit(msg, post) {
   OUTPUTS = SESSION.outputNames;
   post({
     type: 'ready', modelBytes: MODEL_BYTES, inputs: INPUTS, outputs: OUTPUTS,
-    ep: SESSION.ep, threads: SESSION.threads,
+    ep: SESSION.ep, threads: SESSION.threads, fp16, latent: MODEL_LATENT,
   });
 }
 
@@ -213,6 +276,7 @@ async function handleRun(msg, post) {
   const traj = await CN.model.rollout({
     ort: self.ort, sess: SESSION, md, fps,
     overlap: CN.config.overlap, batch: CN.config.batch, histFrames: CN.config.histFrames,
+    latent: MODEL_LATENT, temp: Number(msg.temp) || 0, seed: Number(msg.seed) || 0,
     onProgress: (line) => post({ type: 'progress', phase: 'rollout', done: 0, total: 0, detail: line }),
   });
   if (!traj.length) throw new Error('rollout produced no frames');
