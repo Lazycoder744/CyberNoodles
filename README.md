@@ -10,3 +10,9 @@ legacy WASM fallback), and downloads a `.bsor` replay.
 Visit the site at:
 
 https://lazycoder744.github.io/CyberNoodles/
+
+# Update on website
+
+As far as I can tell, the website inference is utterly broken right now. I will attempt to fix it through the coming days, as I also train the next version of the beta model. Please be patient in the meantime! Thank you!
+
+There is a potential for the Python inference scripts to be released here also, once the weights are updated.
